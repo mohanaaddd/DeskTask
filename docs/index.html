@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DeskTask: Minimalist Desktop To-Do List for Windows 11 and 10</title>
+<meta name="description" content="DeskTask puts tiny, beautiful to-do cards on your Windows desktop. Drag a card onto the green check to finish it. Free, open source, offline, no account.">
+<link rel="canonical" href="https://mohanaaddd.github.io/DeskTask/">
+<meta name="theme-color" content="#0A84FF">
+<meta property="og:type" content="website">
+<meta property="og:title" content="DeskTask: Minimalist Desktop To-Do List for Windows">
+<meta property="og:description" content="Tiny to-do cards on your desktop wallpaper. Drag onto the green check to complete. Free and open source.">
+<meta property="og:url" content="https://mohanaaddd.github.io/DeskTask/">
+<meta property="og:image" content="https://mohanaaddd.github.io/DeskTask/assets/social-preview.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="DeskTask: Minimalist Desktop To-Do List for Windows">
+<meta name="twitter:description" content="Tiny to-do cards on your desktop wallpaper. Free and open source.">
+<meta name="twitter:image" content="https://mohanaaddd.github.io/DeskTask/assets/social-preview.png">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "DeskTask",
+  "applicationCategory": "ProductivityApplication",
+  "operatingSystem": "Windows 10, Windows 11",
+  "description": "A minimalist desktop to-do list and task manager for Windows. Tasks live as small cards on your desktop wallpaper.",
+  "url": "https://mohanaaddd.github.io/DeskTask/",
+  "downloadUrl": "https://github.com/mohanaaddd/DeskTask/releases/latest",
+  "image": "https://mohanaaddd.github.io/DeskTask/assets/social-preview.png",
+  "license": "https://opensource.org/licenses/MIT",
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    { "@type": "Question", "name": "Is DeskTask free?", "acceptedAnswer": { "@type": "Answer", "text": "Yes. DeskTask is free and open source under the MIT license." } },
+    { "@type": "Question", "name": "Does DeskTask need internet or an account?", "acceptedAnswer": { "@type": "Answer", "text": "No. It works fully offline and stores your tasks locally on your PC." } },
+    { "@type": "Question", "name": "Which Windows versions are supported?", "acceptedAnswer": { "@type": "Answer", "text": "Windows 10 and Windows 11." } }
+  ]
+}
+</script>
+<style>
+  :root { --bg:#f5f7fb; --card:#fff; --text:#16181d; --sub:#5c6270; --line:#e3e7ef; --blue:#0a84ff; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0e1117; --card:#171b24; --text:#f2f4f8; --sub:#9aa3b5; --line:#262c3a; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: "Segoe UI Variable Display","Segoe UI",-apple-system,system-ui,sans-serif; background:var(--bg); color:var(--text); line-height:1.6; }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 0 24px; }
+  header { padding: 72px 0 40px; text-align:center; }
+  h1 { font-size: clamp(2.2rem, 5vw, 3.4rem); line-height:1.1; margin:0 0 16px; letter-spacing:-.02em; }
+  .lead { font-size: 1.2rem; color: var(--sub); max-width: 640px; margin: 0 auto 28px; }
+  .btn { display:inline-block; background:var(--blue); color:#fff; text-decoration:none; font-weight:600; padding:14px 28px; border-radius:999px; }
+  .btn.alt { background:transparent; color:var(--text); border:1px solid var(--line); margin-left:8px; }
+  .hero img { width:100%; height:auto; border-radius:20px; border:1px solid var(--line); margin-top:40px; }
+  section { padding: 48px 0; }
+  h2 { font-size: 1.8rem; margin: 0 0 24px; letter-spacing:-.01em; }
+  .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(260px,1fr)); gap:16px; }
+  .tile { background:var(--card); border:1px solid var(--line); border-radius:18px; padding:22px; }
+  .tile h3 { margin:0 0 6px; font-size:1.05rem; }
+  .tile p { margin:0; color:var(--sub); }
+  .shots { display:grid; grid-template-columns: repeat(auto-fit, minmax(240px,1fr)); gap:16px; }
+  .shots img { width:100%; height:auto; border-radius:16px; border:1px solid var(--line); }
+  details { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px 18px; margin-bottom:10px; }
+  summary { font-weight:600; cursor:pointer; }
+  details p { color:var(--sub); margin:10px 0 0; }
+  footer { padding: 40px 0 64px; text-align:center; color:var(--sub); font-size:.95rem; }
+  a { color: var(--blue); }
+</style>
+</head>
+<body>
+<header class="wrap">
+  <h1>Your to-do list, right on your desktop.</h1>
+  <p class="lead">DeskTask turns each task into a small, beautiful card on your Windows wallpaper. Drag it onto the green check when you are done. Free, open source and completely offline.</p>
+  <a class="btn" href="https://github.com/mohanaaddd/DeskTask/releases/latest">Download for Windows</a>
+  <a class="btn alt" href="https://github.com/mohanaaddd/DeskTask">View on GitHub</a>
+  <div class="hero"><img src="assets/hero.png" alt="DeskTask task cards on the Windows desktop with the Tasks window and Customize window" width="1600" height="900"></div>
+</header>
+
+<main class="wrap">
+  <section>
+    <h2>A desktop task manager that stays out of your way</h2>
+    <div class="grid">
+      <div class="tile"><h3>Cards on your wallpaper</h3><p>Every task is its own rounded card, always visible behind your windows. Drag them wherever you like.</p></div>
+      <div class="tile"><h3>Drag to complete</h3><p>Drop a card on the animated green check to finish it. Right-click to delete, with a confirmation and an easy restore.</p></div>
+      <div class="tile"><h3>Weekly progress</h3><p>A clean chart shows what you finished each day, from Saturday to Friday.</p></div>
+      <div class="tile"><h3>Add tasks instantly</h3><p>Press Ctrl+Alt+N from anywhere. DeskTask lives quietly in the system tray.</p></div>
+      <div class="tile"><h3>Beautiful and customizable</h3><p>Light and dark themes, five accent colors, four font weights, adjustable size and opacity.</p></div>
+      <div class="tile"><h3>Private by design</h3><p>No account, no cloud, no telemetry. Your tasks stay in a small file on your PC.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Screenshots</h2>
+    <div class="shots">
+      <img src="assets/screenshot-tasks.png" alt="DeskTask Tasks window with weekly progress chart" loading="lazy">
+      <img src="assets/screenshot-customize.png" alt="DeskTask Customize window" loading="lazy">
+      <img src="assets/screenshot-tutorial.png" alt="DeskTask first-run tutorial" loading="lazy">
+    </div>
+  </section>
+
+  <section>
+    <h2>Frequently asked questions</h2>
+    <details><summary>Is DeskTask free?</summary><p>Yes. It is free and open source under the MIT license.</p></details>
+    <details><summary>Does it need internet or an account?</summary><p>No. It works fully offline and stores your tasks locally on your PC.</p></details>
+    <details><summary>Which Windows versions are supported?</summary><p>Windows 10 and Windows 11.</p></details>
+    <details><summary>Can it start with Windows?</summary><p>Yes. Turn on "Start with Windows" in the tray menu.</p></details>
+  </section>
+</main>
+
+<footer class="wrap">
+  <p>DeskTask is open source under the MIT license. <a href="https://github.com/mohanaaddd/DeskTask">Source code and issues on GitHub</a>.</p>
+</footer>
+</body>
+</html>
