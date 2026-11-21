@@ -8,3 +8,7 @@
 - System tray app: double-click for tasks, Start with Windows, Ctrl+Alt+N to add a task
 - First-run visual tutorial with starter tasks
 - Automatic saving, backup copy, and progress history
+
+
+## 1.0.1
+- Added The Website To Google Search Console For Better SEO
