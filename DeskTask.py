@@ -32,7 +32,7 @@ def set_dpi_aware():
 set_dpi_aware()
 
 APP_NAME = "DeskTask"
-VERSION = "1.0.5"
+VERSION = "1.0.6"
 APPDATA = os.environ.get("APPDATA") or os.path.expanduser("~")
 DATA_DIR = os.path.join(APPDATA, "DeskTask")
 FILE = os.path.join(DATA_DIR, "data.json")
@@ -70,7 +70,6 @@ target = None
 hotkey_win = None
 HINST = None
 cards, panels, q = {}, {}, queue.Queue()
-_desktop = {"shown": False}
 add_ui = None
 _crash_file = None
 _mutex = None
@@ -253,14 +252,19 @@ def next_pos(exclude=None, size=None):
     return free_slot(taken, size)
 
 
-def layer_card(card, desktop_shown=False):
+def layer_card(card):
     """Default: the lowest layer of the screen (behind every window, on the wallpaper).
-    'Keep cards above windows': the highest layer. While the desktop is being shown
-    (Win+D) there is nothing above the cards, so they are lifted just enough to stay visible."""
-    if state["settings"]["above"] or desktop_shown:
+    'Keep cards above windows': the highest layer.
+    If Windows is showing the desktop over the card, it is lifted just enough to stay
+    visible, and dropped straight back as soon as a real window appears on top of it."""
+    if state["settings"]["above"]:
+        card.lifted = False
         card.to_top()
-    else:
-        card.to_bottom()
+        return
+    card.to_bottom()
+    card.lifted = desktop_covers(card)
+    if card.lifted:
+        card.to_top()
 
 
 def place_card(task, x, y):
@@ -268,7 +272,7 @@ def place_card(task, x, y):
     task["x"], task["y"] = x, y
     if c:
         c.move(x - c.pad, y - c.pad)
-        layer_card(c, _desktop["shown"])
+        layer_card(c)
 
 
 def arrange_cards():
@@ -722,7 +726,7 @@ def set_setting(key, value, final=True):
             c.draw()
         if key == "above":
             for c in cards.values():
-                layer_card(c, _desktop["shown"])
+                layer_card(c)
     if final:
         save()
         if key == "accent" and icon is not None:
@@ -789,12 +793,13 @@ user32.IsWindowVisible.argtypes = [W_.HWND]
 user32.IsIconic.argtypes = [W_.HWND]
 user32.GetWindowRect.argtypes = [W_.HWND, ctypes.POINTER(RECT)]
 kernel32.RegisterApplicationRestart.argtypes = [W_.LPCWSTR, W_.DWORD]
-WNDENUMPROC = ctypes.WINFUNCTYPE(W_.BOOL, W_.HWND, W_.LPARAM)
 dwmapi = ctypes.windll.dwmapi
-user32.EnumWindows.argtypes = [WNDENUMPROC, W_.LPARAM]
 user32.GetClassNameW.argtypes = [W_.HWND, W_.LPWSTR, ctypes.c_int]
-user32.GetWindowLongW.argtypes = [W_.HWND, ctypes.c_int]
-user32.GetWindowTextLengthW.argtypes = [W_.HWND]
+user32.WindowFromPoint.argtypes = [W_.POINT]
+user32.WindowFromPoint.restype = W_.HWND
+user32.GetAncestor.argtypes = [W_.HWND, W_.UINT]
+user32.GetAncestor.restype = W_.HWND
+user32.GetForegroundWindow.restype = W_.HWND
 dwmapi.DwmGetWindowAttribute.argtypes = [W_.HWND, W_.DWORD, ctypes.c_void_p, W_.DWORD]
 dwmapi.DwmSetWindowAttribute.argtypes = [W_.HWND, W_.DWORD, ctypes.c_void_p, W_.DWORD]
 user32.RegisterHotKey.argtypes = [W_.HWND, ctypes.c_int, W_.UINT, W_.UINT]
@@ -907,46 +912,25 @@ def work_area(x, y):
     return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
 
 
-SHELL_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd",
-                 "Windows.UI.Core.CoreWindow", "NotifyIconOverflowWindow",
-                 "TopLevelWindowForOverflowXamlIsland", "XamlExplorerHostIslandWindow",
-                 "TaskListThumbnailWnd", "Windows.UI.Composition.DesktopWindowContentBridge"}
+DESKTOP_CLASSES = {"Progman", "WorkerW"}
 
 
-def desktop_has_app_windows():
-    """True if at least one normal app window is showing. False means the desktop is
-    being shown ('Show desktop' button or Win+D), so our cards must stay visible."""
-    found = [False]
-
-    def check(hwnd, _lp):
-        try:
-            if hwnd in windows or not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
-                return True
-            if user32.GetWindowTextLengthW(hwnd) == 0:
-                return True
-            ex = user32.GetWindowLongW(hwnd, -20)
-            if ex & (0x80 | 0x8 | 0x08000000 | 0x20):   # tool, topmost, no-activate, transparent
-                return True
-            cloaked = W_.DWORD(0)
-            dwmapi.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked), 4)
-            if cloaked.value:
-                return True
-            buf = ctypes.create_unicode_buffer(80)
-            user32.GetClassNameW(hwnd, buf, 80)
-            if buf.value in SHELL_CLASSES:
-                return True
-            r = RECT()
-            user32.GetWindowRect(hwnd, ctypes.byref(r))
-            if (r.right - r.left) < 120 or (r.bottom - r.top) < 80:
-                return True
-            found[0] = True
-            return False                                # stop enumerating
-        except Exception:
-            return True
-
-    callback = WNDENUMPROC(check)
-    user32.EnumWindows(callback, 0)
-    return found[0]
+def desktop_covers(card):
+    """True if, right now, the desktop itself is what you see where this card should be
+    (Windows raises the desktop above everything when you 'show desktop').
+    A real app window on top of the card does NOT count: that is exactly where the card belongs."""
+    try:
+        hwnd = user32.WindowFromPoint(W_.POINT(card.x + card.w // 2, card.y + card.h // 2))
+        if not hwnd:
+            return False
+        top = user32.GetAncestor(hwnd, 2) or hwnd              # GA_ROOT
+        if top in windows:                                     # one of our own windows: card is visible
+            return False
+        buf = ctypes.create_unicode_buffer(40)
+        user32.GetClassNameW(top, buf, 40)
+        return buf.value in DESKTOP_CLASSES
+    except Exception:
+        return False
 
 
 def virtual_screen():
@@ -1130,7 +1114,7 @@ class Target(Layered):
 class Card(Layered):
     def __init__(self, task):
         super().__init__()
-        self.task, self.dragging, self.pad = task, False, px(PAD)
+        self.task, self.dragging, self.pad, self.lifted = task, False, px(PAD), False
         self.exclude_from_peek()
         self.draw()
         if task.get("x") is None:
@@ -1139,7 +1123,7 @@ class Card(Layered):
         task["x"], task["y"] = x, y
         self.move(x - self.pad, y - self.pad)
         self.show()
-        layer_card(self, _desktop["shown"])
+        layer_card(self)
 
     def clamp(self, x, y):
         vx, vy, vw, vh = virtual_screen()
@@ -1201,7 +1185,7 @@ class Card(Layered):
             return
         self.dragging = False
         inside = target.contains(*cursor())
-        layer_card(self, _desktop["shown"])
+        layer_card(self)
         if inside:
             target.drop()
             complete_task(self.task)
@@ -1881,19 +1865,29 @@ def poll():
     root.after(100, poll)
 
 
+_watch = {"fg": None, "n": 0}
+
+
 def keep_bottom():
-    """Watchdog, several times a second: keeps every card on its layer, visible and in place.
-    Default: lowest layer. If you show the desktop (Win+D / corner button) and no window is
-    left above the cards, they are lifted so Windows cannot hide them."""
+    """Runs every 30 ms. Re-checks every card the instant the focused window changes
+    (so switching from the desktop to a window never leaves a card on top), otherwise about
+    every 120 ms; cards that are lifted are re-checked less often to avoid any flicker.
+    About every 0.4 s it also re-shows or re-positions a card Windows hid or moved."""
     try:
-        _desktop["shown"] = not desktop_has_app_windows()
+        fg = user32.GetForegroundWindow()
+        _watch["n"] += 1
+        n, changed = _watch["n"], fg != _watch["fg"]
+        _watch["fg"] = fg
         for card in list(cards.values()):
-            if not card.dragging:
+            if card.dragging:
+                continue
+            if changed or n % (8 if card.lifted else 4) == 0:
+                layer_card(card)
+            if n % 13 == 0:
                 card.heal()
-                layer_card(card, _desktop["shown"])
     except Exception:
         log_exc()
-    root.after(400, keep_bottom)
+    root.after(30, keep_bottom)
 
 
 def already_running():

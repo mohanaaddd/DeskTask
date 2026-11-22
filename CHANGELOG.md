@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.6
+- Fixed: cards briefly showing above windows when switching from the desktop to a window
+- Cards now react instantly to window changes and only lift when the desktop itself covers them
+
 ## 1.0.5
 - Cards sit on the lowest layer by default and stay visible when the desktop is shown
 - New "Keep cards above windows" switch (highest layer)
