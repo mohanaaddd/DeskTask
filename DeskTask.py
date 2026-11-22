@@ -32,7 +32,7 @@ def set_dpi_aware():
 set_dpi_aware()
 
 APP_NAME = "DeskTask"
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 APPDATA = os.environ.get("APPDATA") or os.path.expanduser("~")
 DATA_DIR = os.path.join(APPDATA, "DeskTask")
 FILE = os.path.join(DATA_DIR, "data.json")
@@ -55,7 +55,7 @@ PAD = 30        # shadow margin around windows (logical px)
 
 WEIGHTS = ("regular", "semibold", "bold", "extra")
 state = {"settings": {"theme": "light", "accent": "Blue", "size": 15,
-                      "opacity": 95, "behind": True, "weight": "semibold",
+                      "opacity": 95, "above": False, "weight": "semibold",
                       "capitalize": False},
          "tasks": [],
          "history": {},                      # completed-per-day counts (survives deleting tasks)
@@ -70,6 +70,7 @@ target = None
 hotkey_win = None
 HINST = None
 cards, panels, q = {}, {}, queue.Queue()
+_desktop = {"shown": False}
 add_ui = None
 _crash_file = None
 _mutex = None
@@ -252,25 +253,54 @@ def next_pos(exclude=None, size=None):
     return free_slot(taken, size)
 
 
+def layer_card(card, desktop_shown=False):
+    """Default: the lowest layer of the screen (behind every window, on the wallpaper).
+    'Keep cards above windows': the highest layer. While the desktop is being shown
+    (Win+D) there is nothing above the cards, so they are lifted just enough to stay visible."""
+    if state["settings"]["above"] or desktop_shown:
+        card.to_top()
+    else:
+        card.to_bottom()
+
+
 def place_card(task, x, y):
     c = cards.get(task["id"])
     task["x"], task["y"] = x, y
     if c:
         c.move(x - c.pad, y - c.pad)
-        if state["settings"]["behind"]:
-            c.to_bottom()
+        layer_card(c, _desktop["shown"])
 
 
 def arrange_cards():
-    """Neatly re-lays out every card so none covers another."""
-    taken = []
+    """Glides every card, one after another, into a neat layout where none covers another."""
+    plan, taken = [], []
     for t in sorted(tasks_with("active"), key=lambda t: t.get("created", "")):
         c = cards.get(t["id"])
-        size = (c.w - 2 * c.pad, c.h - 2 * c.pad) if c else None
+        if not c:
+            continue
+        size = (c.w - 2 * c.pad, c.h - 2 * c.pad)
         x, y = free_slot(taken, size)
-        place_card(t, x, y)
-        taken.append(card_rect(t))
-    save()
+        taken.append((x, y, size[0], size[1]))
+        plan.append((t, c, x, y))
+    steps, stagger = 24, 70
+
+    def glide(t, c, x1, y1):
+        x0, y0 = c.x + c.pad, c.y + c.pad
+
+        def frame(k):
+            if c.hwnd not in windows:                       # card was completed or deleted meanwhile
+                return
+            if k >= steps:
+                place_card(t, x1, y1)
+                return
+            e = ease_out_back((k + 1) / steps)              # smooth glide with a tiny overshoot
+            c.move(x0 + (x1 - x0) * e - c.pad, y0 + (y1 - y0) * e - c.pad)
+            root.after(16, lambda: frame(k + 1))
+        frame(0)
+
+    for i, (t, c, x, y) in enumerate(plan):
+        root.after(i * stagger, lambda t=t, c=c, x=x, y=y: glide(t, c, x, y))
+    root.after(len(plan) * stagger + steps * 16 + 150, save)
 
 
 def separate_overlaps():
@@ -690,9 +720,9 @@ def set_setting(key, value, final=True):
     elif final:
         for c in cards.values():
             c.draw()
-        if key == "behind":
+        if key == "above":
             for c in cards.values():
-                c.to_bottom() if value else c.to_normal()
+                layer_card(c, _desktop["shown"])
     if final:
         save()
         if key == "accent" and icon is not None:
@@ -1109,8 +1139,7 @@ class Card(Layered):
         task["x"], task["y"] = x, y
         self.move(x - self.pad, y - self.pad)
         self.show()
-        if state["settings"]["behind"]:
-            self.to_bottom()
+        layer_card(self, _desktop["shown"])
 
     def clamp(self, x, y):
         vx, vy, vw, vh = virtual_screen()
@@ -1172,7 +1201,7 @@ class Card(Layered):
             return
         self.dragging = False
         inside = target.contains(*cursor())
-        self.to_normal()
+        layer_card(self, _desktop["shown"])
         if inside:
             target.drop()
             complete_task(self.task)
@@ -1182,8 +1211,6 @@ class Card(Layered):
             self.move(x - self.pad, y - self.pad)
             self.task["x"], self.task["y"] = x, y
             save()
-            if state["settings"]["behind"]:
-                self.to_bottom()
 
     def on_rpress(self):                                       # right-click asks before deleting
         if not self.dragging and self.task.get("status") == "active":
@@ -1322,8 +1349,8 @@ class CustomizePanel(Panel):
         g.line([(36, 524), (324, 524)], 1, th["sep"])
         g.text(36, 452, "Capitalize Each Word", 14.5, th["text"])
         switch(g, th, 260, 438, s["capitalize"], lambda: set_setting("capitalize", not s["capitalize"]))
-        g.text(36, 500, "Keep cards behind windows", 14.5, th["text"])
-        switch(g, th, 260, 486, s["behind"], lambda: set_setting("behind", not s["behind"]))
+        g.text(36, 500, "Keep cards above windows", 14.5, th["text"])
+        switch(g, th, 260, 486, s["above"], lambda: set_setting("above", not s["above"]))
         g.text(36, 548, "Start with Windows", 14.5, th["text"])
         switch(g, th, 260, 534, startup_enabled(), toggle_startup)
 
@@ -1854,27 +1881,16 @@ def poll():
     root.after(100, poll)
 
 
-_desktop = {"shown": None}
-
-
 def keep_bottom():
-    """Watchdog (runs several times a second).
-    - normal: cards sit behind your windows, on the wallpaper
-    - 'Show desktop' / Win+D (no app windows left): cards go on top so they stay visible
-    - any card Windows hid or moved is re-shown and put back"""
+    """Watchdog, several times a second: keeps every card on its layer, visible and in place.
+    Default: lowest layer. If you show the desktop (Win+D / corner button) and no window is
+    left above the cards, they are lifted so Windows cannot hide them."""
     try:
-        shown = not desktop_has_app_windows()
-        _desktop["shown"] = shown
+        _desktop["shown"] = not desktop_has_app_windows()
         for card in list(cards.values()):
-            if card.dragging:
-                continue
-            card.heal()
-            if shown:
-                card.to_top()
-            elif state["settings"]["behind"]:
-                card.to_bottom()
-            else:
-                card.to_normal()
+            if not card.dragging:
+                card.heal()
+                layer_card(card, _desktop["shown"])
     except Exception:
         log_exc()
     root.after(400, keep_bottom)

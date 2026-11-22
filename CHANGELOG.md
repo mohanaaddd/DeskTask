@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.5
+- Cards sit on the lowest layer by default and stay visible when the desktop is shown
+- New "Keep cards above windows" switch (highest layer)
+- Arrange cards now glides the cards into place
+- Fixed: cards disappeared when showing the desktop
+
 ## 1.0.3
 - Fixed: adding a task could place the new card exactly on top of an existing one, making the old task look like it disappeared. New cards now go to the first free spot, and cards that were already stacked are separated on startup
 - New: "Capitalize Each Word" option in Customize
