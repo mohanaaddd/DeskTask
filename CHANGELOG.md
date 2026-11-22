@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.3
+- Fixed: adding a task could place the new card exactly on top of an existing one, making the old task look like it disappeared. New cards now go to the first free spot, and cards that were already stacked are separated on startup
+- New: "Capitalize Each Word" option in Customize
+- New: "Arrange cards" in the tray menu neatly lays out all cards
+
 ## 1.0.0
 - Desktop task cards with drag-to-complete and an animated green check button
 - Delete with confirmation; deleted tasks can be restored
@@ -8,7 +13,3 @@
 - System tray app: double-click for tasks, Start with Windows, Ctrl+Alt+N to add a task
 - First-run visual tutorial with starter tasks
 - Automatic saving, backup copy, and progress history
-
-
-## 1.0.1
-- Added The Website To Google Search Console For Better SEO

@@ -32,7 +32,7 @@ def set_dpi_aware():
 set_dpi_aware()
 
 APP_NAME = "DeskTask"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 APPDATA = os.environ.get("APPDATA") or os.path.expanduser("~")
 DATA_DIR = os.path.join(APPDATA, "DeskTask")
 FILE = os.path.join(DATA_DIR, "data.json")
@@ -55,7 +55,8 @@ PAD = 30        # shadow margin around windows (logical px)
 
 WEIGHTS = ("regular", "semibold", "bold", "extra")
 state = {"settings": {"theme": "light", "accent": "Blue", "size": 15,
-                      "opacity": 95, "behind": True, "weight": "semibold"},
+                      "opacity": 95, "behind": True, "weight": "semibold",
+                      "capitalize": False},
          "tasks": [],
          "history": {},                      # completed-per-day counts (survives deleting tasks)
          "meta": {"tutorial_seen": False}}
@@ -91,6 +92,14 @@ def log_exc():
 
 def px(n):
     return int(n * S)
+
+
+def display_text(text):
+    """Task text as shown on screen (optionally Capitalizing Each Word). Stored text is never changed."""
+    text = str(text)
+    if not state["settings"].get("capitalize"):
+        return text
+    return "\n".join(" ".join(w[:1].upper() + w[1:] for w in line.split(" ")) for line in text.split("\n"))
 
 
 def now_iso():
@@ -207,9 +216,76 @@ def today_count():
     return int(state["history"].get(date.today().isoformat(), 0))
 
 
-def next_pos():
-    n = len(tasks_with("active"))
-    return px(350) + (n // 8) * px(320), px(160) + (n % 8) * px(72)
+def card_rect(task):
+    c = cards.get(task["id"])
+    w, h = (c.w - 2 * c.pad, c.h - 2 * c.pad) if c else (px(300), px(60))
+    return (task["x"], task["y"], w, h)
+
+
+def overlap_fraction(a, b):
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ix = max(0, min(ax + aw, bx + bw) - max(ax, bx))
+    iy = max(0, min(ay + ah, by + bh) - max(ay, by))
+    return (ix * iy) / max(1, min(aw * ah, bw * bh))
+
+
+def free_slot(taken, size=None):
+    """First position on the desktop where a card would not cover any rectangle in `taken`."""
+    w, h = size or (px(300), px(60))
+    left, top, right, bottom = work_area(0, 0)
+    step, col_w = px(72), px(320)
+    rows = max(1, (bottom - top - px(160) - px(40)) // step)
+    cols = max(1, (right - left - px(350) - w) // col_w + 1)
+    for col in range(cols):
+        for row in range(rows):
+            x, y = left + px(350) + col * col_w, top + px(160) + row * step
+            if all(overlap_fraction((x, y, w, h), r) == 0 for r in taken):
+                return x, y
+    n = len(taken)                                              # screen is full: cascade
+    return left + px(350) + (n % 10) * px(24), top + px(160) + (n % 10) * px(24)
+
+
+def next_pos(exclude=None, size=None):
+    taken = [card_rect(t) for t in tasks_with("active")
+             if t.get("x") is not None and t["id"] != exclude]
+    return free_slot(taken, size)
+
+
+def place_card(task, x, y):
+    c = cards.get(task["id"])
+    task["x"], task["y"] = x, y
+    if c:
+        c.move(x - c.pad, y - c.pad)
+        if state["settings"]["behind"]:
+            c.to_bottom()
+
+
+def arrange_cards():
+    """Neatly re-lays out every card so none covers another."""
+    taken = []
+    for t in sorted(tasks_with("active"), key=lambda t: t.get("created", "")):
+        c = cards.get(t["id"])
+        size = (c.w - 2 * c.pad, c.h - 2 * c.pad) if c else None
+        x, y = free_slot(taken, size)
+        place_card(t, x, y)
+        taken.append(card_rect(t))
+    save()
+
+
+def separate_overlaps():
+    """Fixes cards that were stacked on top of each other (including by older versions)."""
+    actives = [t for t in tasks_with("active") if t["id"] in cards]
+    done = []
+    for t in actives:
+        r = card_rect(t)
+        if any(overlap_fraction(r, p) > 0.3 for p in done):
+            others = [card_rect(o) for o in actives if o is not t]
+            x, y = free_slot(others, (r[2], r[3]))
+            place_card(t, x, y)
+            r = card_rect(t)
+        done.append(r)
+    save()
 
 
 def add_task(text):
@@ -258,8 +334,10 @@ def restore_task(task):
     task["status"] = "active"
     task.pop("done_at", None)
     task.pop("deleted_at", None)
-    if task.get("x") is None:
-        task["x"], task["y"] = next_pos()
+    if task.get("x") is None or any(
+            overlap_fraction(card_rect(task), card_rect(o)) > 0.3
+            for o in tasks_with("active") if o is not task and o.get("x") is not None):
+        task["x"], task["y"] = next_pos(exclude=task["id"])
     cards[task["id"]] = Card(task)
     save()
     refresh_all()
@@ -990,7 +1068,7 @@ class Card(Layered):
         lh = int((asc + desc) * 1.12)
         cw, hp, vp, dot, radius = px(300), px(18), px(16), px(8), px(18)
         tx = hp + dot + px(12)
-        lines = wrap(str(self.task["text"]), f, cw - tx - hp)
+        lines = wrap(display_text(self.task["text"]), f, cw - tx - hp)
         if len(lines) > 12:
             lines = lines[:12]
             lines[-1] = lines[-1].rstrip() + "\u2026"
@@ -1152,7 +1230,7 @@ class Panel(Layered):
 
 
 class CustomizePanel(Panel):
-    key, bw, bh = "customize", 360, 548
+    key, bw, bh = "customize", 360, 596
 
     def draw(self, g, th):
         s = state["settings"]
@@ -1182,12 +1260,15 @@ class CustomizePanel(Panel):
         seg_control(g, th, 20, 376, 320, 34, ["Regular", "Semibold", "Bold", "Extra Bold"],
                     WEIGHTS.index(s["weight"]), [lambda w=w: set_setting("weight", w) for w in WEIGHTS])
 
-        g.rrect(20, 428, 320, 96, 16, fill=th["row"])
+        g.rrect(20, 428, 320, 144, 16, fill=th["row"])
         g.line([(36, 476), (324, 476)], 1, th["sep"])
-        g.text(36, 452, "Keep cards behind windows", 14.5, th["text"])
-        switch(g, th, 260, 438, s["behind"], lambda: set_setting("behind", not s["behind"]))
-        g.text(36, 500, "Start with Windows", 14.5, th["text"])
-        switch(g, th, 260, 486, startup_enabled(), toggle_startup)
+        g.line([(36, 524), (324, 524)], 1, th["sep"])
+        g.text(36, 452, "Capitalize Each Word", 14.5, th["text"])
+        switch(g, th, 260, 438, s["capitalize"], lambda: set_setting("capitalize", not s["capitalize"]))
+        g.text(36, 500, "Keep cards behind windows", 14.5, th["text"])
+        switch(g, th, 260, 486, s["behind"], lambda: set_setting("behind", not s["behind"]))
+        g.text(36, 548, "Start with Windows", 14.5, th["text"])
+        switch(g, th, 260, 534, startup_enabled(), toggle_startup)
 
 
 class TasksPanel(Panel):
@@ -1270,7 +1351,7 @@ class TasksPanel(Panel):
                     "deleted": [("undo", acc)]}[self.tab]
             verb, stamp = {"active": ("Added", "created"), "done": ("Completed", "done_at"),
                            "deleted": ("Deleted", "deleted_at")}[self.tab]
-            title = g.fit(t["text"].replace("\n", " "), 14.5, 340 - 56 - len(btns) * 38 - 6)
+            title = g.fit(display_text(t["text"]).replace("\n", " "), 14.5, 340 - 56 - len(btns) * 38 - 6)
             g.text(56, y + 20, title, 14.5, th["text"])
             g.text(56, y + 38, f"{verb} {when(t.get(stamp, ''))}", 11, th["sub"])
             for j, (kind, col) in enumerate(btns):
@@ -1459,7 +1540,7 @@ class ConfirmPanel(Panel):
     def draw(self, g, th):
         g.hit(0, 0, self.bw, self.bh, "move", None)
         g.text(26, 40, "Delete this task?", 18, th["text"], bold=True)
-        g.text(26, 72, g.fit(str(self.task["text"]).replace("\n", " "), 14, self.bw - 52), 14, th["sub"])
+        g.text(26, 72, g.fit(display_text(self.task["text"]).replace("\n", " "), 14, self.bw - 52), 14, th["sub"])
         g.text(26, 96, "You can restore it later from Tasks.", 12, th["sub"])
         w = (self.bw - 52 - 12) / 2
         g.rrect(26, 124, w, 40, 20, fill=th["seg"])
@@ -1791,6 +1872,10 @@ def run():
         except Exception:
             log_exc()
     hotkey_win = HotkeyWin()
+    try:
+        separate_overlaps()
+    except Exception:
+        log_exc()
     if fresh:                               # starter tasks for the tutorial
         for text in ("Drink a glass of water", "Stretch for five minutes", "Plan tomorrow's top three"):
             try:
@@ -1804,6 +1889,7 @@ def run():
         pystray.MenuItem(lambda item: f"Tasks ({menu_state['left']} left)",
                          lambda: post(TasksPanel)),
         pystray.MenuItem("Customize", lambda: post(CustomizePanel)),
+        pystray.MenuItem("Arrange cards", lambda: post(arrange_cards)),
         pystray.MenuItem("How to use", lambda: post(TutorialPanel)),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Start with Windows", lambda: post(toggle_startup),
