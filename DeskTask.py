@@ -32,7 +32,7 @@ def set_dpi_aware():
 set_dpi_aware()
 
 APP_NAME = "DeskTask"
-VERSION = "1.0.1"
+VERSION = "1.0.4"
 APPDATA = os.environ.get("APPDATA") or os.path.expanduser("~")
 DATA_DIR = os.path.join(APPDATA, "DeskTask")
 FILE = os.path.join(DATA_DIR, "data.json")
@@ -759,6 +759,14 @@ user32.IsWindowVisible.argtypes = [W_.HWND]
 user32.IsIconic.argtypes = [W_.HWND]
 user32.GetWindowRect.argtypes = [W_.HWND, ctypes.POINTER(RECT)]
 kernel32.RegisterApplicationRestart.argtypes = [W_.LPCWSTR, W_.DWORD]
+WNDENUMPROC = ctypes.WINFUNCTYPE(W_.BOOL, W_.HWND, W_.LPARAM)
+dwmapi = ctypes.windll.dwmapi
+user32.EnumWindows.argtypes = [WNDENUMPROC, W_.LPARAM]
+user32.GetClassNameW.argtypes = [W_.HWND, W_.LPWSTR, ctypes.c_int]
+user32.GetWindowLongW.argtypes = [W_.HWND, ctypes.c_int]
+user32.GetWindowTextLengthW.argtypes = [W_.HWND]
+dwmapi.DwmGetWindowAttribute.argtypes = [W_.HWND, W_.DWORD, ctypes.c_void_p, W_.DWORD]
+dwmapi.DwmSetWindowAttribute.argtypes = [W_.HWND, W_.DWORD, ctypes.c_void_p, W_.DWORD]
 user32.RegisterHotKey.argtypes = [W_.HWND, ctypes.c_int, W_.UINT, W_.UINT]
 user32.UpdateLayeredWindow.argtypes = [W_.HWND, W_.HDC, ctypes.POINTER(W_.POINT),
                                        ctypes.POINTER(W_.SIZE), W_.HDC,
@@ -869,6 +877,48 @@ def work_area(x, y):
     return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
 
 
+SHELL_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd",
+                 "Windows.UI.Core.CoreWindow", "NotifyIconOverflowWindow",
+                 "TopLevelWindowForOverflowXamlIsland", "XamlExplorerHostIslandWindow",
+                 "TaskListThumbnailWnd", "Windows.UI.Composition.DesktopWindowContentBridge"}
+
+
+def desktop_has_app_windows():
+    """True if at least one normal app window is showing. False means the desktop is
+    being shown ('Show desktop' button or Win+D), so our cards must stay visible."""
+    found = [False]
+
+    def check(hwnd, _lp):
+        try:
+            if hwnd in windows or not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+                return True
+            if user32.GetWindowTextLengthW(hwnd) == 0:
+                return True
+            ex = user32.GetWindowLongW(hwnd, -20)
+            if ex & (0x80 | 0x8 | 0x08000000 | 0x20):   # tool, topmost, no-activate, transparent
+                return True
+            cloaked = W_.DWORD(0)
+            dwmapi.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked), 4)
+            if cloaked.value:
+                return True
+            buf = ctypes.create_unicode_buffer(80)
+            user32.GetClassNameW(hwnd, buf, 80)
+            if buf.value in SHELL_CLASSES:
+                return True
+            r = RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(r))
+            if (r.right - r.left) < 120 or (r.bottom - r.top) < 80:
+                return True
+            found[0] = True
+            return False                                # stop enumerating
+        except Exception:
+            return True
+
+    callback = WNDENUMPROC(check)
+    user32.EnumWindows(callback, 0)
+    return found[0]
+
+
 def virtual_screen():
     return tuple(user32.GetSystemMetrics(i) for i in (76, 77, 78, 79))   # x, y, w, h
 
@@ -884,6 +934,12 @@ class Layered:
         self.x = self.y = self.w = self.h = 0
         self.alpha = 255
         self.mem = self.bmp = self.old = None
+
+    def exclude_from_peek(self):
+        try:                                               # DWMWA_EXCLUDED_FROM_PEEK
+            dwmapi.DwmSetWindowAttribute(self.hwnd, 12, ctypes.byref(ctypes.c_int(1)), 4)
+        except Exception:
+            pass
 
     def on_press(self): pass
     def on_rpress(self): pass
@@ -1045,6 +1101,7 @@ class Card(Layered):
     def __init__(self, task):
         super().__init__()
         self.task, self.dragging, self.pad = task, False, px(PAD)
+        self.exclude_from_peek()
         self.draw()
         if task.get("x") is None:
             task["x"], task["y"] = next_pos()
@@ -1797,14 +1854,30 @@ def poll():
     root.after(100, poll)
 
 
+_desktop = {"shown": None}
+
+
 def keep_bottom():
-    """Watchdog: keeps cards visible, in place and behind other windows."""
-    for card in list(cards.values()):
-        if not card.dragging:
+    """Watchdog (runs several times a second).
+    - normal: cards sit behind your windows, on the wallpaper
+    - 'Show desktop' / Win+D (no app windows left): cards go on top so they stay visible
+    - any card Windows hid or moved is re-shown and put back"""
+    try:
+        shown = not desktop_has_app_windows()
+        _desktop["shown"] = shown
+        for card in list(cards.values()):
+            if card.dragging:
+                continue
             card.heal()
-            if state["settings"]["behind"]:
+            if shown:
+                card.to_top()
+            elif state["settings"]["behind"]:
                 card.to_bottom()
-    root.after(1000, keep_bottom)
+            else:
+                card.to_normal()
+    except Exception:
+        log_exc()
+    root.after(400, keep_bottom)
 
 
 def already_running():
