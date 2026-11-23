@@ -8,7 +8,7 @@ Cards:                             drag anywhere; drop on the green check to com
 """
 import tkinter as tk
 import tkinter.font as tkfont
-import atexit, collections, ctypes, faulthandler, json, shutil, threading, math, os, queue, sys, time, traceback, uuid
+import atexit, collections, ctypes, faulthandler, json, re, shutil, threading, math, os, queue, sys, time, traceback, uuid
 from ctypes import wintypes as W_
 from datetime import date, datetime, timedelta
 import winreg
@@ -32,7 +32,7 @@ def set_dpi_aware():
 set_dpi_aware()
 
 APP_NAME = "DeskTask"
-VERSION = "1.0.6"
+VERSION = "1.0.7"
 APPDATA = os.environ.get("APPDATA") or os.path.expanduser("~")
 DATA_DIR = os.path.join(APPDATA, "DeskTask")
 FILE = os.path.join(DATA_DIR, "data.json")
@@ -70,6 +70,8 @@ target = None
 hotkey_win = None
 HINST = None
 cards, panels, q = {}, {}, queue.Queue()
+card_z = []                   # task ids, front-most card first
+card_menu = None
 add_ui = None
 _crash_file = None
 _mutex = None
@@ -100,6 +102,21 @@ def display_text(text):
     if not state["settings"].get("capitalize"):
         return text
     return "\n".join(" ".join(w[:1].upper() + w[1:] for w in line.split(" ")) for line in text.split("\n"))
+
+
+def split_items(text):
+    return [s.strip() for s in re.split(r"[,;\n]+", str(text)) if s.strip()]
+
+
+def task_items(task):
+    return [s for s in str(task["text"]).split("\n") if s.strip()]
+
+
+def task_plain(task):
+    """One-line version of a task, for lists and dialogs."""
+    if task.get("kind") in ("bullets", "numbers"):
+        return " \u00b7 ".join(display_text(i) for i in task_items(task))
+    return display_text(task["text"]).replace("\n", " ")
 
 
 def now_iso():
@@ -252,19 +269,32 @@ def next_pos(exclude=None, size=None):
     return free_slot(taken, size)
 
 
-def layer_card(card):
-    """Default: the lowest layer of the screen (behind every window, on the wallpaper).
-    'Keep cards above windows': the highest layer.
-    If Windows is showing the desktop over the card, it is lifted just enough to stay
-    visible, and dropped straight back as soon as a real window appears on top of it."""
+def bring_front(card):
+    tid = card.task["id"]
+    if tid in card_z:
+        card_z.remove(tid)
+    card_z.insert(0, tid)
+
+
+def layer_all():
+    """Puts every card on its layer AND keeps their order among themselves stable
+    (the card you touched last stays in front), so cards never swap places by themselves.
+    Default: lowest layer of the screen. 'Keep cards above windows': highest layer.
+    If Windows is showing the desktop over a card, it is lifted just enough to stay visible."""
+    order = [cards[i] for i in card_z if i in cards] + [c for i, c in cards.items() if i not in card_z]
     if state["settings"]["above"]:
-        card.lifted = False
-        card.to_top()
+        for c in reversed(order):                        # back first, so the front card ends on top
+            c.lifted = False
+            c.to_top()
         return
-    card.to_bottom()
-    card.lifted = desktop_covers(card)
-    if card.lifted:
-        card.to_top()
+    lifted = []
+    for c in order:                                      # front first, so the front card stays above the rest
+        c.to_bottom()
+        c.lifted = desktop_covers(c)
+        if c.lifted:
+            lifted.append(c)
+    for c in reversed(lifted):
+        c.to_top()
 
 
 def place_card(task, x, y):
@@ -272,7 +302,49 @@ def place_card(task, x, y):
     task["x"], task["y"] = x, y
     if c:
         c.move(x - c.pad, y - c.pad)
-        layer_card(c)
+        layer_all()
+
+
+def refit_card(task):
+    """After a card changed size (e.g. became a list): keep it on screen and off other cards."""
+    c = cards.get(task["id"])
+    if not c:
+        return
+    c.draw()
+    x, y = c.clamp(task["x"], task["y"])
+    size = (c.w - 2 * c.pad, c.h - 2 * c.pad)
+    others = [card_rect(o) for o in tasks_with("active") if o is not task and o["id"] in cards]
+    if any(overlap_fraction((x, y) + size, r) > 0.3 for r in others):
+        x, y = free_slot(others, size)
+    place_card(task, x, y)
+
+
+def set_kind(task, kind):
+    """Right-click menu: turn a task into a bullet / numbered list, or back to a normal task."""
+    old = task.get("kind", "task")
+    new = "task" if old == kind else kind
+    items = split_items(task["text"]) if old == "task" else task_items(task)
+    if new == "task":
+        task["text"] = ", ".join(items) or task["text"]
+        task.pop("kind", None)
+    else:
+        task["text"] = "\n".join(items or [str(task["text"]).strip()])
+        task["kind"] = new
+    refit_card(task)
+    save()
+    refresh_all()
+    if new != "task" and len(task_items(task)) < 2:         # one item only: let the user add more
+        add_dialog(edit_task=task)
+
+
+def set_items(task, text):
+    items = split_items(text)
+    if not items:
+        return
+    task["text"] = "\n".join(items) if task.get("kind") in ("bullets", "numbers") else ", ".join(items)
+    refit_card(task)
+    save()
+    refresh_all()
 
 
 def arrange_cards():
@@ -535,6 +607,19 @@ def compose_shadow(final, pad, cw, ch, radius, offset=4, blur=9, alpha=55):
     return Image.alpha_composite(shadow, final)
 
 
+def compose_shadow_multi(final, rects, offset=4, blur=9, alpha=55):
+    """Soft shadow under several rounded rectangles (x, y, w, h, radius, all in final pixels)."""
+    W, H = final.size
+    sh = Image.new("L", (W, H), 0)
+    d = ImageDraw.Draw(sh)
+    for x, y, w, h, r in rects:
+        d.rounded_rectangle((x, y + px(offset), x + w - 1, y + px(offset) + h - 1), radius=r, fill=alpha)
+    sh = sh.filter(ImageFilter.GaussianBlur(px(blur)))
+    shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    shadow.putalpha(sh)
+    return Image.alpha_composite(shadow, final)
+
+
 def make_card_base(cw, ch, radius, th):
     pad = px(PAD)
     W, H = cw + 2 * pad, ch + 2 * pad
@@ -675,6 +760,20 @@ def icon_undo(g, cx, cy, s, color, w=2.0):
         g.line([tip, (tip[0] - rx * h, tip[1] - ry * h)], w, color)
 
 
+def icon_bullets(g, cx, cy, s, color, w=1.8):
+    for k in (-1, 0, 1):
+        y = cy + k * .34 * s
+        g.circle(cx - .38 * s, y, .1 * s, fill=color)
+        g.line([(cx - .12 * s, y), (cx + .42 * s, y)], w, color)
+
+
+def icon_numbers(g, cx, cy, s, color, w=1.8):
+    for k in (-1, 0, 1):
+        y = cy + k * .34 * s
+        g.text(cx - .38 * s, y, str(k + 2), s * .46, color, bold=True, anchor="mm")
+        g.line([(cx - .08 * s, y), (cx + .42 * s, y)], w, color)
+
+
 # ---- UI building blocks
 def seg_control(g, th, x, y, w, h, labels, sel, cbs):
     g.rrect(x, y, w, h, 10, fill=th["seg"])
@@ -725,8 +824,7 @@ def set_setting(key, value, final=True):
         for c in cards.values():
             c.draw()
         if key == "above":
-            for c in cards.values():
-                layer_card(c)
+            layer_all()
     if final:
         save()
         if key == "accent" and icon is not None:
@@ -1117,13 +1215,14 @@ class Card(Layered):
         self.task, self.dragging, self.pad, self.lifted = task, False, px(PAD), False
         self.exclude_from_peek()
         self.draw()
+        bring_front(self)
         if task.get("x") is None:
             task["x"], task["y"] = next_pos()
         x, y = self.clamp(task["x"], task["y"])
         task["x"], task["y"] = x, y
         self.move(x - self.pad, y - self.pad)
         self.show()
-        layer_card(self)
+        layer_all()
 
     def clamp(self, x, y):
         vx, vy, vw, vh = virtual_screen()
@@ -1137,21 +1236,44 @@ class Card(Layered):
         asc, desc = f.getmetrics()
         lh = int((asc + desc) * 1.12)
         cw, hp, vp, dot, radius = px(300), px(18), px(16), px(8), px(18)
-        tx = hp + dot + px(12)
-        lines = wrap(display_text(self.task["text"]), f, cw - tx - hp)
-        if len(lines) > 12:
-            lines = lines[:12]
-            lines[-1] = lines[-1].rstrip() + "\u2026"
-        ch = max(px(54), 2 * vp + lh * len(lines))
+        kind = self.task.get("kind", "task")
+        is_list = kind in ("bullets", "numbers")
+        tx = hp if is_list else hp + dot + px(12)
+        rows, marks = [], []                       # rows: (indent, text); marks: (row index, item number)
+        if is_list:
+            items = task_items(self.task) or [""]
+            prefix_w = px(20) if kind == "bullets" else int(f.getlength(f"{len(items)}.")) + px(10)
+            for n, item in enumerate(items, 1):
+                marks.append((len(rows), n))
+                for line in wrap(display_text(item), f, cw - tx - hp - prefix_w) or [""]:
+                    rows.append((prefix_w, line))
+        else:
+            rows = [(0, line) for line in wrap(display_text(self.task["text"]), f, cw - tx - hp)]
+        cap = 16 if is_list else 12
+        if len(rows) > cap:
+            rows = rows[:cap]
+            rows[-1] = (rows[-1][0], rows[-1][1].rstrip() + "\u2026")
+            marks = [m for m in marks if m[0] < cap]
+        ch = max(px(54), 2 * vp + lh * len(rows))
         big, pad, W, H = make_card_base(cw, ch, radius, th)
-        y0 = pad + (ch - lh * len(lines)) // 2
-        dc = y0 + int(asc * 0.62)
-        ImageDraw.Draw(big).ellipse(((pad + hp) * SS, (dc - dot // 2) * SS,
-                                     (pad + hp + dot) * SS, (dc + dot // 2 + dot % 2) * SS), fill=acc)
+        y0 = pad + (ch - lh * len(rows)) // 2
+        bd = ImageDraw.Draw(big)
+        if not is_list:
+            dc = y0 + int(asc * 0.62)
+            bd.ellipse(((pad + hp) * SS, (dc - dot // 2) * SS, (pad + hp + dot) * SS,
+                        (dc + dot // 2 + dot % 2) * SS), fill=acc)
+        elif kind == "bullets":
+            r = max(2, px(3))
+            for ri, _n in marks:
+                cx, cy = pad + tx + px(5), y0 + ri * lh + int(asc * 0.62)
+                bd.ellipse(((cx - r) * SS, (cy - r) * SS, (cx + r) * SS, (cy + r) * SS), fill=acc)
         body = big.resize((W, H), Image.LANCZOS)
         d = ImageDraw.Draw(body)
-        for i, line in enumerate(lines):
-            d.text((pad + tx, y0 + i * lh), line, font=f, fill=th["text"])
+        for i, (indent, line) in enumerate(rows):
+            d.text((pad + tx + indent, y0 + i * lh), line, font=f, fill=th["text"])
+        if kind == "numbers":
+            for ri, n in marks:
+                d.text((pad + tx, y0 + ri * lh), f"{n}.", font=f, fill=acc)
         self.alpha = int(255 * s["opacity"] / 100)
         self.set_image(compose_shadow(body, pad, cw, ch, radius))
 
@@ -1160,6 +1282,8 @@ class Card(Layered):
 
     # dragging is driven by polling the mouse, so nothing can interrupt it
     def on_press(self):
+        if card_menu:
+            card_menu.close()
         self.sx, self.sy = cursor()
         self.ox, self.oy = self.x, self.y
         self.dragging = False
@@ -1172,6 +1296,7 @@ class Card(Layered):
         cx, cy = cursor()
         if not self.dragging and abs(cx - self.sx) + abs(cy - self.sy) > px(4):
             self.dragging = True
+            bring_front(self)
             self.to_top()
             target.show()
         if self.dragging:
@@ -1185,7 +1310,7 @@ class Card(Layered):
             return
         self.dragging = False
         inside = target.contains(*cursor())
-        layer_card(self)
+        layer_all()
         if inside:
             target.drop()
             complete_task(self.task)
@@ -1196,9 +1321,9 @@ class Card(Layered):
             self.task["x"], self.task["y"] = x, y
             save()
 
-    def on_rpress(self):                                       # right-click asks before deleting
+    def on_rpress(self):                                       # right-click opens the card menu
         if not self.dragging and self.task.get("status") == "active":
-            ConfirmPanel(self.task)
+            CardMenu(self)
 
     def fade_out(self):
         def fade(a):
@@ -1298,7 +1423,7 @@ class Panel(Layered):
 
 
 class CustomizePanel(Panel):
-    key, bw, bh = "customize", 360, 596
+    key, bw, bh = "customize", 360, 580
 
     def draw(self, g, th):
         s = state["settings"]
@@ -1328,15 +1453,15 @@ class CustomizePanel(Panel):
         seg_control(g, th, 20, 376, 320, 34, ["Regular", "Semibold", "Bold", "Extra Bold"],
                     WEIGHTS.index(s["weight"]), [lambda w=w: set_setting("weight", w) for w in WEIGHTS])
 
-        g.rrect(20, 428, 320, 144, 16, fill=th["row"])
-        g.line([(36, 476), (324, 476)], 1, th["sep"])
-        g.line([(36, 524), (324, 524)], 1, th["sep"])
-        g.text(36, 452, "Capitalize Each Word", 14.5, th["text"])
-        switch(g, th, 260, 438, s["capitalize"], lambda: set_setting("capitalize", not s["capitalize"]))
-        g.text(36, 500, "Keep cards above windows", 14.5, th["text"])
-        switch(g, th, 260, 486, s["above"], lambda: set_setting("above", not s["above"]))
-        g.text(36, 548, "Start with Windows", 14.5, th["text"])
-        switch(g, th, 260, 534, startup_enabled(), toggle_startup)
+        g.rrect(20, 428, 320, 132, 16, fill=th["row"])
+        for ly in (472, 516):
+            g.line([(36, ly), (324, ly)], 1, th["sep"])
+        g.text(36, 450, "Capitalize Each Word", 14.5, th["text"])
+        switch(g, th, 260, 436, s["capitalize"], lambda: set_setting("capitalize", not s["capitalize"]))
+        g.text(36, 494, "Keep cards above windows", 14.5, th["text"])
+        switch(g, th, 260, 480, s["above"], lambda: set_setting("above", not s["above"]))
+        g.text(36, 538, "Start with Windows", 14.5, th["text"])
+        switch(g, th, 260, 524, startup_enabled(), toggle_startup)
 
 
 class TasksPanel(Panel):
@@ -1419,7 +1544,7 @@ class TasksPanel(Panel):
                     "deleted": [("undo", acc)]}[self.tab]
             verb, stamp = {"active": ("Added", "created"), "done": ("Completed", "done_at"),
                            "deleted": ("Deleted", "deleted_at")}[self.tab]
-            title = g.fit(display_text(t["text"]).replace("\n", " "), 14.5, 340 - 56 - len(btns) * 38 - 6)
+            title = g.fit(task_plain(t), 14.5, 340 - 56 - len(btns) * 38 - 6)
             g.text(56, y + 20, title, 14.5, th["text"])
             g.text(56, y + 38, f"{verb} {when(t.get(stamp, ''))}", 11, th["sub"])
             for j, (kind, col) in enumerate(btns):
@@ -1608,7 +1733,7 @@ class ConfirmPanel(Panel):
     def draw(self, g, th):
         g.hit(0, 0, self.bw, self.bh, "move", None)
         g.text(26, 40, "Delete this task?", 18, th["text"], bold=True)
-        g.text(26, 72, g.fit(display_text(self.task["text"]).replace("\n", " "), 14, self.bw - 52), 14, th["sub"])
+        g.text(26, 72, g.fit(task_plain(self.task), 14, self.bw - 52), 14, th["sub"])
         g.text(26, 96, "You can restore it later from Tasks.", 12, th["sub"])
         w = (self.bw - 52 - 12) / 2
         g.rrect(26, 124, w, 40, 20, fill=th["seg"])
@@ -1619,13 +1744,158 @@ class ConfirmPanel(Panel):
         g.hit(38 + w, 124, w, 40, "click", self.confirm)
 
 
-# ================================================================== add-task bar
-def add_dialog():
-    global add_ui
-    if add_ui is not None:                       # already open: just bring the focus back
-        try:
-            add_ui["focus"]()
+class CardMenu(Layered):
+    """Right-click menu beside a card: two list types and Delete, as equal rounded buttons in a
+    rounded container. Hovering a button inverts its colours and shows an info card for it."""
+    BW, BH, GAP, PADC, SPACE, IW, IH = 150, 42, 8, 10, 10, 244, 118
+    CW = BW + 2 * PADC
+    CH = 3 * BH + 2 * GAP + 2 * PADC
+    ITEMS = (
+        ("bullets", "Bullet list", "Turns this task into a bulleted list. Separate the items with commas."),
+        ("numbers", "Numbered list", "Turns this task into a numbered list. Separate the items with commas."),
+        ("delete", "Delete", "Removes this task. You will be asked to confirm, and you can restore it from Tasks."),
+    )
+
+    def __init__(self, card):
+        global card_menu
+        if card_menu is not None:
+            card_menu.close()
+        super().__init__(cls=CLS_PANEL)
+        card_menu = self
+        self.card, self.task = card, card.task
+        self.hover, self.closed, self.born = None, False, time.time()
+        content_w = self.CW + self.SPACE + self.IW
+        self.lw, self.lh = content_w + 2 * PAD, self.CH + 2 * PAD
+        left, top, right, bottom = work_area(card.x, card.y)
+        card_l, card_r, gap = card.x + card.pad, card.x + card.w - card.pad, px(12)
+        self.side = "right" if card_r + gap + px(content_w) <= right else "left"
+        self.x0 = card_r + gap if self.side == "right" else card_l - gap - px(content_w)
+        mid = card.y + card.h // 2
+        self.y0 = min(max(mid - px(self.CH) // 2, top + px(8)), bottom - px(self.CH) - px(8))
+        self.cont_x = 0 if self.side == "right" else self.IW + self.SPACE
+        self.info_x = self.CW + self.SPACE if self.side == "right" else 0
+        self.render()
+        self.move(self.x0 - px(PAD), self.y0 - px(PAD))
+        self.show()
+        self.to_top()
+        self.tick()
+
+    # --- geometry (logical units, relative to the content box)
+    def local(self, cx, cy):
+        return (cx - self.x0) / S, (cy - self.y0) / S
+
+    def btn_rect(self, i):
+        return self.cont_x + self.PADC, self.PADC + i * (self.BH + self.GAP)
+
+    def info_y(self, i):
+        mid = self.PADC + i * (self.BH + self.GAP) + self.BH / 2
+        return min(max(mid - self.IH / 2, 0), self.CH - self.IH)
+
+    def item_at(self, cx, cy):
+        lx, ly = self.local(cx, cy)
+        for i in range(len(self.ITEMS)):
+            bx, by = self.btn_rect(i)
+            if bx <= lx <= bx + self.BW and by <= ly <= by + self.BH:
+                return i
+        return None
+
+    def inside(self, cx, cy):
+        lx, ly = self.local(cx, cy)
+        if self.cont_x <= lx <= self.cont_x + self.CW and 0 <= ly <= self.CH:
+            return True
+        if self.hover is not None:
+            iy = self.info_y(self.hover)
+            return self.info_x <= lx <= self.info_x + self.IW and iy <= ly <= iy + self.IH
+        return False
+
+    def render(self):
+        if self.closed:
             return
+        th, acc = theme(), accent()
+        kind = self.task.get("kind", "task")
+        g = Gfx(self.lw, self.lh, 3, origin=PAD)
+        g.rrect(self.cont_x, 0, self.CW, self.CH, 18, fill=th["bg"], outline=th["sep"])
+        rects = [(px(PAD + self.cont_x), px(PAD), px(self.CW), px(self.CH), px(18))]
+        for i, (key, label, _desc) in enumerate(self.ITEMS):
+            bx, by = self.btn_rect(i)
+            if key == "delete":
+                fill, fg, hfill, hfg = mix(RED, th["bg"], .15), RED, RED, "#FFFFFF"
+            elif key == kind:                                    # the type this task already is
+                fill, fg, hfill, hfg = mix(acc, th["bg"], .2), acc, acc, "#FFFFFF"
+            else:
+                fill, fg, hfill, hfg = th["seg"], th["text"], th["text"], th["bg"]
+            if self.hover == i:                                  # hovered: colours inverted
+                fill, fg = hfill, hfg
+            g.rrect(bx, by, self.BW, self.BH, 12, fill=fill)
+            icon = {"bullets": icon_bullets, "numbers": icon_numbers, "delete": icon_trash}[key]
+            icon(g, bx + 22, by + self.BH / 2, 17, fg)
+            g.text(bx + 42, by + self.BH / 2, label, 13, fg, bold=True)
+        if self.hover is not None:
+            key, label, desc = self.ITEMS[self.hover]
+            iy = self.info_y(self.hover)
+            g.rrect(self.info_x, iy, self.IW, self.IH, 16, fill=th["card"], outline=th["sep"])
+            if key == kind:
+                label = f"{label} (on)"
+                desc = "This task is a " + ("bulleted" if key == "bullets" else "numbered") + \
+                       " list. Click to turn it back into a normal task."
+            g.text(self.info_x + 16, iy + 26, label, 14.5, th["text"], bold=True)
+            for k, line in enumerate(wrap(desc, g.font(12.5), (self.IW - 32) * S)[:4]):
+                g.text(self.info_x + 16, iy + 54 + k * 19, line, 12.5, th["sub"])
+            rects.append((px(PAD + self.info_x), px(PAD + iy), px(self.IW), px(self.IH), px(16)))
+        self.set_image(compose_shadow_multi(g.result(), rects))
+
+    def on_press(self):
+        i = self.item_at(*cursor())
+        if i is not None:
+            self.activate(i)
+
+    def activate(self, i):
+        key, task = self.ITEMS[i][0], self.task
+        self.close()
+        if key == "delete":
+            ConfirmPanel(task)
+        else:
+            set_kind(task, key)
+
+    def tick(self):
+        if self.closed:
+            return
+        try:
+            cx, cy = cursor()
+            hov = self.item_at(cx, cy)
+            if hov != self.hover:
+                self.hover = hov
+                self.render()
+            esc = user32.GetAsyncKeyState(0x1B) & 0x8000
+            down = (user32.GetAsyncKeyState(0x01) | user32.GetAsyncKeyState(0x02)) & 0x8000
+            gone = self.task.get("status") != "active" or self.task["id"] not in cards
+            if gone or esc or (down and time.time() - self.born > 0.25 and not self.inside(cx, cy)):
+                self.close()
+                return
+            self.to_top()
+        except Exception:
+            log_exc()
+        root.after(30, self.tick)
+
+    def close(self):
+        global card_menu
+        if self.closed:
+            return
+        self.closed = True
+        if card_menu is self:
+            card_menu = None
+        self.destroy()
+
+
+# ================================================================== add-task bar
+def add_dialog(edit_task=None):
+    global add_ui
+    if add_ui is not None:
+        try:
+            if edit_task is None:                # already open: just bring the focus back
+                add_ui["focus"]()
+                return
+            add_ui["close"]()
         except Exception:
             add_ui = None
     s = state["settings"]
@@ -1649,8 +1919,12 @@ def add_dialog():
     entry = tk.Entry(win, relief="flat", bd=0, font=(TK_FONT, -px(17)), bg=th["card"], fg=th["sub"],
                      insertbackground=ACCENTS[s["accent"]], highlightthickness=0)
     entry.pack(fill="both", expand=True)
-    entry.insert(0, "New task")
-    ph = {"on": True}
+    ph = {"on": edit_task is None}
+    if edit_task is None:
+        entry.insert(0, "New task")
+    else:                                         # editing a list: show its items, ready for more
+        entry.config(fg=th["text"])
+        entry.insert(0, ", ".join(task_items(edit_task)) + (", " if len(task_items(edit_task)) < 2 else ""))
     done = {"v": False}
     opened = time.time()
 
@@ -1669,7 +1943,10 @@ def add_dialog():
     def submit(_=None):
         text = "" if ph["on"] else entry.get().strip()
         close()
-        if text:
+        if edit_task is not None:
+            if text:
+                set_items(edit_task, text)
+        elif text:
             add_task(text)
 
     def on_key(e):
@@ -1692,7 +1969,7 @@ def add_dialog():
             pass
         entry.focus_force()
         if first:
-            entry.icursor(0)
+            entry.icursor(0 if edit_task is None else "end")
 
     def watch():
         """Closes the bar on Esc, on a click anywhere outside it, or after a minute of nothing."""
@@ -1869,22 +2146,21 @@ _watch = {"fg": None, "n": 0}
 
 
 def keep_bottom():
-    """Runs every 30 ms. Re-checks every card the instant the focused window changes
-    (so switching from the desktop to a window never leaves a card on top), otherwise about
-    every 120 ms; cards that are lifted are re-checked less often to avoid any flicker.
-    About every 0.4 s it also re-shows or re-positions a card Windows hid or moved."""
+    """Runs every 30 ms. Re-checks the cards the instant the focused window changes (so switching
+    from the desktop to a window never leaves a card on top), otherwise about every 120 ms
+    (240 ms while a card is lifted, to avoid flicker). About every 0.4 s it also re-shows or
+    re-positions a card Windows hid or moved. While you drag a card it touches nothing."""
     try:
-        fg = user32.GetForegroundWindow()
-        _watch["n"] += 1
-        n, changed = _watch["n"], fg != _watch["fg"]
-        _watch["fg"] = fg
-        for card in list(cards.values()):
-            if card.dragging:
-                continue
-            if changed or n % (8 if card.lifted else 4) == 0:
-                layer_card(card)
+        if not any(c.dragging for c in cards.values()):
+            fg = user32.GetForegroundWindow()
+            _watch["n"] += 1
+            n, changed = _watch["n"], fg != _watch["fg"]
+            _watch["fg"] = fg
+            if changed or n % (8 if any(c.lifted for c in cards.values()) else 4) == 0:
+                layer_all()
             if n % 13 == 0:
-                card.heal()
+                for card in list(cards.values()):
+                    card.heal()
     except Exception:
         log_exc()
     root.after(30, keep_bottom)
