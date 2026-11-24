@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.8
+### New
+- **Lists have a headline.** A bullet or numbered list now shows its first line as a larger headline, with a thin rule and then the items below it.
+- **Type list items right on the card.** Choose Bullet list or Numbered list from the right-click menu: your task text becomes the headline and an empty box appears under it. Type an item and another empty box appears, and so on. Enter moves to the next line, Enter on an empty line (or the Save button, or clicking away) saves, Esc cancels, and Backspace on an empty line removes it. No more commas.
+- **Edit by double-click.** Double-click a list card to edit its headline and items; double-click a normal card to rename it.
+- Existing lists from 1.0.7 are converted automatically (the first line becomes the headline).
+### Fixed
+- **Flickering.** When two cards overlapped, the top one flickered now and then, and sometimes every card did. A background check re-sent every card to its layer several times a second, which briefly swapped overlapping cards. DeskTask now changes the stacking only when something actually changes (focus, the desktop being shown, a card being dragged or added) and does nothing while idle or while you drag.
+- Cards no longer fight Windows over their position if the system keeps its own.
+
 ## 1.0.7
 ### New
 - **Right-click menu.** Right-clicking a card opens a small rounded container beside it with three equal buttons: **Bullet list**, **Numbered list** and **Delete**. Hovering a button inverts its colors and shows an info card explaining it. Clicking the active list type turns the task back into a normal one.

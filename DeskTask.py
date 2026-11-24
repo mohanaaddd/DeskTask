@@ -32,7 +32,7 @@ def set_dpi_aware():
 set_dpi_aware()
 
 APP_NAME = "DeskTask"
-VERSION = "1.0.7"
+VERSION = "1.0.8"
 APPDATA = os.environ.get("APPDATA") or os.path.expanduser("~")
 DATA_DIR = os.path.join(APPDATA, "DeskTask")
 FILE = os.path.join(DATA_DIR, "data.json")
@@ -104,19 +104,19 @@ def display_text(text):
     return "\n".join(" ".join(w[:1].upper() + w[1:] for w in line.split(" ")) for line in text.split("\n"))
 
 
-def split_items(text):
-    return [s.strip() for s in re.split(r"[,;\n]+", str(text)) if s.strip()]
-
-
 def task_items(task):
-    return [s for s in str(task["text"]).split("\n") if s.strip()]
+    """The items of a bullet / numbered list (the task's text is its headline)."""
+    return [str(s) for s in task.get("items", []) if str(s).strip()]
 
 
 def task_plain(task):
-    """One-line version of a task, for lists and dialogs."""
+    """One-line version of a task, for the Tasks list and dialogs."""
+    head = display_text(task["text"]).replace("\n", " ")
     if task.get("kind") in ("bullets", "numbers"):
-        return " \u00b7 ".join(display_text(i) for i in task_items(task))
-    return display_text(task["text"]).replace("\n", " ")
+        items = [display_text(i) for i in task_items(task)]
+        if items:
+            return head + " \u00b7 " + " \u00b7 ".join(items)
+    return head
 
 
 def now_iso():
@@ -175,6 +175,9 @@ def load_state():
                 t.setdefault("created", now_iso())
                 t.setdefault("x", None)
                 t.setdefault("y", None)
+                if t.get("kind") in ("bullets", "numbers") and "items" not in t:     # 1.0.7 lists
+                    lines = [ln for ln in str(t["text"]).split("\n") if ln.strip()]
+                    t["text"], t["items"] = (lines[0] if lines else "List"), lines[1:]
                 tasks.append(t)
         state["tasks"] = tasks
         hist = data.get("history")
@@ -276,25 +279,101 @@ def bring_front(card):
     card_z.insert(0, tid)
 
 
-def layer_all():
-    """Puts every card on its layer AND keeps their order among themselves stable
-    (the card you touched last stays in front), so cards never swap places by themselves.
-    Default: lowest layer of the screen. 'Keep cards above windows': highest layer.
-    If Windows is showing the desktop over a card, it is lifted just enough to stay visible."""
-    order = [cards[i] for i in card_z if i in cards] + [c for i, c in cards.items() if i not in card_z]
+_layer = {"sig": None, "lifted": set(), "hold": 0.0, "reassert": 0.0}
+DESKTOPISH = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd",
+              "NotifyIconOverflowWindow", "TopLevelWindowForOverflowXamlIsland"}
+
+
+def ordered_cards():
+    return [cards[i] for i in card_z if i in cards] + [c for i, c in cards.items() if i not in card_z]
+
+
+def layer_sig():
+    return (state["settings"]["above"], tuple(c.task["id"] for c in ordered_cards()),
+            frozenset(_layer["lifted"]))
+
+
+def sync_layers():
+    """Tell the layer system the current stacking is already right (new / removed card)."""
+    _layer["sig"] = layer_sig()
+
+
+def apply_layers():
+    """Re-applies the stacking of every card. It is only called when something really changed:
+    every call briefly swaps overlapping cards, and that swap is what used to flicker."""
+    order = ordered_cards()
+    lifted = {c.task["id"] for c in order} & _layer["lifted"]
     if state["settings"]["above"]:
-        for c in reversed(order):                        # back first, so the front card ends on top
+        for c in reversed(order):                         # back first, so the front card ends on top
             c.lifted = False
             c.to_top()
+    else:
+        for c in order:                                   # front first: the front card stays above
+            c.to_bottom()
+        for c in reversed([c for c in order if c.task["id"] in lifted]):
+            c.to_top()
+        for c in order:
+            c.lifted = c.task["id"] in lifted
+    sync_layers()
+
+
+def foreground_is_desktop():
+    """True if the desktop / taskbar has the focus, False if an app does, None if unknown."""
+    try:
+        fg = user32.GetForegroundWindow()
+        if not fg:
+            return None
+        top = user32.GetAncestor(fg, 2) or fg
+        if top in windows:
+            return None
+        buf = ctypes.create_unicode_buffer(60)
+        user32.GetClassNameW(top, buf, 60)
+        return buf.value in DESKTOPISH
+    except Exception:
+        return None
+
+
+def foreign_covers(card):
+    """True if some window that is not ours is drawn over the card's centre."""
+    try:
+        hwnd = user32.WindowFromPoint(W_.POINT(card.x + card.w // 2, card.y + card.h // 2))
+        if not hwnd:
+            return False
+        top = user32.GetAncestor(hwnd, 2) or hwnd
+        if top in windows:
+            return False
+        buf = ctypes.create_unicode_buffer(40)
+        user32.GetClassNameW(top, buf, 40)
+        return buf.value not in DESKTOP_CLASSES
+    except Exception:
+        return False
+
+
+def check_layers():
+    """Looks (without touching any window) for a reason to change the stacking."""
+    now = time.time()
+    order = [c for c in ordered_cards() if not c.editing]
+    if state["settings"]["above"]:
+        if now - _layer["reassert"] > 1.5 and any(foreign_covers(c) for c in order):
+            _layer["reassert"] = now                      # something else got on top of the cards
+            apply_layers()
+        elif layer_sig() != _layer["sig"]:
+            apply_layers()
         return
-    lifted = []
-    for c in order:                                      # front first, so the front card stays above the rest
-        c.to_bottom()
-        c.lifted = desktop_covers(c)
-        if c.lifted:
-            lifted.append(c)
-    for c in reversed(lifted):
-        c.to_top()
+    lifted = _layer["lifted"]
+    changed = False
+    relower = bool(lifted) and now >= _layer["hold"] and foreground_is_desktop() is False
+    if relower:                                           # an app has the focus again: back down
+        lifted.clear()
+        apply_layers()
+    for c in order:                                       # desktop shown over a card: lift it
+        if c.task["id"] not in lifted and desktop_covers(c):
+            lifted.add(c.task["id"])
+            changed = True
+            if relower:
+                _layer["hold"] = now + 2.0                # don't ping-pong
+    if changed or layer_sig() != _layer["sig"]:
+        apply_layers()
 
 
 def place_card(task, x, y):
@@ -302,7 +381,6 @@ def place_card(task, x, y):
     task["x"], task["y"] = x, y
     if c:
         c.move(x - c.pad, y - c.pad)
-        layer_all()
 
 
 def refit_card(task):
@@ -320,31 +398,35 @@ def refit_card(task):
 
 
 def set_kind(task, kind):
-    """Right-click menu: turn a task into a bullet / numbered list, or back to a normal task."""
+    """Right-click menu. On a normal task: it becomes a list whose headline is its text, and you
+    type the items right on the card. On a list: switch bullets <-> numbers, or click the active
+    type again to turn it back into a normal task."""
     old = task.get("kind", "task")
-    new = "task" if old == kind else kind
-    items = split_items(task["text"]) if old == "task" else task_items(task)
-    if new == "task":
-        task["text"] = ", ".join(items) or task["text"]
+    if old == kind:
+        items = task_items(task)
+        task["text"] = task["text"] + (": " + ", ".join(items) if items else "")
         task.pop("kind", None)
-    else:
-        task["text"] = "\n".join(items or [str(task["text"]).strip()])
-        task["kind"] = new
-    refit_card(task)
-    save()
-    refresh_all()
-    if new != "task" and len(task_items(task)) < 2:         # one item only: let the user add more
-        add_dialog(edit_task=task)
-
-
-def set_items(task, text):
-    items = split_items(text)
-    if not items:
+        task.pop("items", None)
+        refit_card(task)
+        save()
+        refresh_all()
         return
-    task["text"] = "\n".join(items) if task.get("kind") in ("bullets", "numbers") else ", ".join(items)
+    task["kind"] = kind
+    task.setdefault("items", [])
     refit_card(task)
     save()
     refresh_all()
+    if old == "task":
+        ListEditor(task)
+
+
+def rename_task(task, text):
+    text = text.strip()[:300]
+    if text:
+        task["text"] = text
+        refit_card(task)
+        save()
+        refresh_all()
 
 
 def arrange_cards():
@@ -410,6 +492,7 @@ def complete_task(task):
     task["done_at"] = now_iso()
     bump_history(task["done_at"], 1)
     card = cards.pop(task["id"], None)
+    sync_layers()
     if card:
         card.fade_out()
     save()
@@ -425,6 +508,7 @@ def delete_task(task):
     task["status"] = "deleted"
     task["deleted_at"] = now_iso()
     card = cards.pop(task["id"], None)
+    sync_layers()
     if card:
         card.fade_out()
     deleted = sorted(tasks_with("deleted"), key=lambda t: t.get("deleted_at", ""))
@@ -824,7 +908,8 @@ def set_setting(key, value, final=True):
         for c in cards.values():
             c.draw()
         if key == "above":
-            layer_all()
+            _layer["lifted"].clear()
+            apply_layers()
     if final:
         save()
         if key == "accent" and icon is not None:
@@ -1112,13 +1197,21 @@ class Layered:
     def hide(self): user32.ShowWindow(self.hwnd, 0)
     def heal(self):
         """Self-repair: re-show and re-position the window if Windows hid or moved it."""
+        if getattr(self, "editing", False):
+            return
         try:
             if not user32.IsWindowVisible(self.hwnd) or user32.IsIconic(self.hwnd):
                 self.show()
             r = RECT()
             user32.GetWindowRect(self.hwnd, ctypes.byref(r))
-            if (r.left, r.top) != (self.x, self.y):
-                self.move(self.x, self.y)
+            if abs(r.left - self.x) > 2 or abs(r.top - self.y) > 2:
+                self._misses = getattr(self, "_misses", 0) + 1
+                if self._misses <= 2:
+                    self.move(self.x, self.y)
+                else:                                     # the system insists: accept where it is
+                    self.x, self.y = r.left, r.top
+            else:
+                self._misses = 0
         except Exception:
             log_exc()
 
@@ -1213,16 +1306,30 @@ class Card(Layered):
     def __init__(self, task):
         super().__init__()
         self.task, self.dragging, self.pad, self.lifted = task, False, px(PAD), False
+        self.editing, self.last_click = False, 0.0
         self.exclude_from_peek()
         self.draw()
-        bring_front(self)
         if task.get("x") is None:
             task["x"], task["y"] = next_pos()
         x, y = self.clamp(task["x"], task["y"])
         task["x"], task["y"] = x, y
         self.move(x - self.pad, y - self.pad)
         self.show()
-        layer_all()
+        tid = task["id"]                                   # join the stack without disturbing the others
+        cards[tid] = self
+        if tid in card_z:
+            card_z.remove(tid)
+        if state["settings"]["above"]:
+            card_z.insert(0, tid)
+            self.to_top()
+        else:
+            card_z.append(tid)
+            self.to_bottom()
+        sync_layers()
+
+    def destroy(self):
+        super().destroy()
+        sync_layers()
 
     def clamp(self, x, y):
         vx, vy, vw, vh = virtual_screen()
@@ -1239,41 +1346,55 @@ class Card(Layered):
         kind = self.task.get("kind", "task")
         is_list = kind in ("bullets", "numbers")
         tx = hp if is_list else hp + dot + px(12)
-        rows, marks = [], []                       # rows: (indent, text); marks: (row index, item number)
+        rows, marks = [], []             # rows: (indent, text, font, line height, ascent, gap before)
         if is_list:
-            items = task_items(self.task) or [""]
+            hf = load_font(round(s["size"] * 1.32 * S), "extra" if s["weight"] == "extra" else "bold")
+            ha, hd = hf.getmetrics()
+            hlh = int((ha + hd) * 1.1)
+            for line in wrap(display_text(self.task["text"]), hf, cw - tx - hp) or [""]:
+                rows.append((0, line, hf, hlh, ha, 0))
+            items = task_items(self.task)
             prefix_w = px(20) if kind == "bullets" else int(f.getlength(f"{len(items)}.")) + px(10)
             for n, item in enumerate(items, 1):
                 marks.append((len(rows), n))
-                for line in wrap(display_text(item), f, cw - tx - hp - prefix_w) or [""]:
-                    rows.append((prefix_w, line))
+                for k, line in enumerate(wrap(display_text(item), f, cw - tx - hp - prefix_w) or [""]):
+                    rows.append((prefix_w, line, f, lh, asc, px(9) if (n == 1 and k == 0) else 0))
         else:
-            rows = [(0, line) for line in wrap(display_text(self.task["text"]), f, cw - tx - hp)]
-        cap = 16 if is_list else 12
+            rows = [(0, line, f, lh, asc, 0) for line in wrap(display_text(self.task["text"]), f, cw - tx - hp)]
+        cap = 18 if is_list else 12
         if len(rows) > cap:
             rows = rows[:cap]
-            rows[-1] = (rows[-1][0], rows[-1][1].rstrip() + "\u2026")
+            last = rows[-1]
+            rows[-1] = (last[0], last[1].rstrip() + "\u2026") + last[2:]
             marks = [m for m in marks if m[0] < cap]
-        ch = max(px(54), 2 * vp + lh * len(rows))
+        total = sum(r[3] + r[5] for r in rows)
+        ch = max(px(54), 2 * vp + total)
         big, pad, W, H = make_card_base(cw, ch, radius, th)
-        y0 = pad + (ch - lh * len(rows)) // 2
+        y, ys = pad + (ch - total) // 2, []
+        for r in rows:
+            y += r[5]
+            ys.append(y)
+            y += r[3]
         bd = ImageDraw.Draw(big)
         if not is_list:
-            dc = y0 + int(asc * 0.62)
+            dc = ys[0] + int(asc * 0.62)
             bd.ellipse(((pad + hp) * SS, (dc - dot // 2) * SS, (pad + hp + dot) * SS,
                         (dc + dot // 2 + dot % 2) * SS), fill=acc)
         elif kind == "bullets":
-            r = max(2, px(3))
+            rad = max(2, px(3))
             for ri, _n in marks:
-                cx, cy = pad + tx + px(5), y0 + ri * lh + int(asc * 0.62)
-                bd.ellipse(((cx - r) * SS, (cy - r) * SS, (cx + r) * SS, (cy + r) * SS), fill=acc)
+                cx, cy = pad + tx + px(5), ys[ri] + int(asc * 0.62)
+                bd.ellipse(((cx - rad) * SS, (cy - rad) * SS, (cx + rad) * SS, (cy + rad) * SS), fill=acc)
         body = big.resize((W, H), Image.LANCZOS)
         d = ImageDraw.Draw(body)
-        for i, (indent, line) in enumerate(rows):
-            d.text((pad + tx + indent, y0 + i * lh), line, font=f, fill=th["text"])
+        if marks:                                            # thin rule between headline and items
+            ry = ys[marks[0][0]] - px(5)
+            d.line((pad + tx, ry, pad + cw - hp, ry), fill=th["border"], width=1)
+        for i, (indent, line, font, _lh, _asc, _gap) in enumerate(rows):
+            d.text((pad + tx + indent, ys[i]), line, font=font, fill=th["text"])
         if kind == "numbers":
             for ri, n in marks:
-                d.text((pad + tx, y0 + ri * lh), f"{n}.", font=f, fill=acc)
+                d.text((pad + tx, ys[ri]), f"{n}.", font=f, fill=acc)
         self.alpha = int(255 * s["opacity"] / 100)
         self.set_image(compose_shadow(body, pad, cw, ch, radius))
 
@@ -1306,11 +1427,17 @@ class Card(Layered):
         root.after(8, self.tick)
 
     def release(self):
-        if not self.dragging:
+        if not self.dragging:                              # a plain click: two of them edit the card
+            now = time.time()
+            if now - self.last_click < 0.45 and not card_menu:
+                self.last_click = 0.0
+                self.edit()
+            else:
+                self.last_click = now
             return
         self.dragging = False
         inside = target.contains(*cursor())
-        layer_all()
+        apply_layers()                                     # the dragged card goes back to its layer
         if inside:
             target.drop()
             complete_task(self.task)
@@ -1320,6 +1447,12 @@ class Card(Layered):
             self.move(x - self.pad, y - self.pad)
             self.task["x"], self.task["y"] = x, y
             save()
+
+    def edit(self):
+        if self.task.get("kind") in ("bullets", "numbers"):
+            ListEditor(self.task)
+        else:
+            add_dialog(edit_task=self.task)
 
     def on_rpress(self):                                       # right-click opens the card menu
         if not self.dragging and self.task.get("status") == "active":
@@ -1751,8 +1884,8 @@ class CardMenu(Layered):
     CW = BW + 2 * PADC
     CH = 3 * BH + 2 * GAP + 2 * PADC
     ITEMS = (
-        ("bullets", "Bullet list", "Turns this task into a bulleted list. Separate the items with commas."),
-        ("numbers", "Numbered list", "Turns this task into a numbered list. Separate the items with commas."),
+        ("bullets", "Bullet list", "Your text becomes the headline. Then type the list items right on the card."),
+        ("numbers", "Numbered list", "Your text becomes the headline. Then type the numbered items right on the card."),
         ("delete", "Delete", "Removes this task. You will be asked to confirm, and you can restore it from Tasks."),
     )
 
@@ -1836,8 +1969,7 @@ class CardMenu(Layered):
             g.rrect(self.info_x, iy, self.IW, self.IH, 16, fill=th["card"], outline=th["sep"])
             if key == kind:
                 label = f"{label} (on)"
-                desc = "This task is a " + ("bulleted" if key == "bullets" else "numbered") + \
-                       " list. Click to turn it back into a normal task."
+                desc = "Double-click the card to edit its items. Click here to turn it back into a normal task."
             g.text(self.info_x + 16, iy + 26, label, 14.5, th["text"], bold=True)
             for k, line in enumerate(wrap(desc, g.font(12.5), (self.IW - 32) * S)[:4]):
                 g.text(self.info_x + 16, iy + 54 + k * 19, line, 12.5, th["sub"])
@@ -1887,6 +2019,292 @@ class CardMenu(Layered):
         self.destroy()
 
 
+# ================================================================== list editor (typed right on the card)
+list_editor = None
+
+
+def force_focus(win, widget):
+    try:                                       # lets us take the keyboard even when opened by a hotkey
+        win.update_idletasks()
+        hwnd = user32.GetParent(win.winfo_id()) or win.winfo_id()
+        user32.keybd_event(0x12, 0, 0, 0)
+        user32.keybd_event(0x12, 0, 2, 0)
+        user32.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+    widget.focus_force()
+
+
+class EditorBG(Layered):
+    """The rounded card (with Save button) behind the text boxes."""
+
+    def __init__(self, editor):
+        super().__init__(cls=CLS_PANEL)
+        self.editor = editor
+
+    def on_press(self):
+        self.editor.bg_press()
+
+
+class _Row:
+    pass
+
+
+class ListEditor:
+    """Edit a list on the card itself: a headline, then one text box per item. Typing in the last
+    box adds a fresh empty one below it. Enter moves to the next line; Enter on an empty line,
+    the Save button or a click outside saves; Esc cancels."""
+    MAX_ITEMS = 20
+
+    def __init__(self, task):
+        global list_editor
+        if list_editor is not None:
+            list_editor.save()
+        list_editor = self
+        s, th = state["settings"], theme()
+        self.task, self.card = task, cards.get(task["id"])
+        self.kind = task.get("kind", "bullets")
+        self.th, self.acc, self.closed, self.born = th, accent(), False, time.time()
+        self.cw, self.hp, self.vp = px(300), px(18), px(14)
+        self.ew = self.cw - 2 * self.hp
+        self.f_head = tkfont.Font(family=TK_FONT, size=-round(s["size"] * 1.32 * S), weight="bold")
+        self.f_item = tkfont.Font(family=TK_FONT, size=-round(s["size"] * S))
+        self.f_pre = tkfont.Font(family=TK_FONT, size=-round(s["size"] * S), weight="bold")
+        self.head_h = self.f_head.metrics("linespace") + px(12)
+        self.row_h = self.f_item.metrics("linespace") + px(12)
+        self.pw = px(24) if self.kind == "bullets" else max(px(24), self.f_item.measure("00.") + px(8))
+        c = self.card
+        self.bx, self.by = (c.x + c.pad, c.y + c.pad) if c else (px(350), px(160))
+        if c:                                       # the card is replaced by the editor while editing
+            c.editing = True
+            c.hide()
+        self.bg = EditorBG(self)
+        self.win = tk.Toplevel(root)
+        self.win.overrideredirect(True)
+        self.win.configure(bg=th["card"])
+        self.win.attributes("-topmost", True)
+        self.rows = []
+        # headline
+        self.head_var = tk.StringVar(value=str(task["text"]))
+        self.head = tk.Entry(self.win, textvariable=self.head_var, font=self.f_head, bd=0, relief="flat",
+                             bg=th["card"], fg=th["text"], insertbackground=self.acc, highlightthickness=0)
+        self.head_ph = tk.Label(self.win, text="Headline", font=self.f_head, bg=th["card"], fg=th["sub"], anchor="w")
+        self.head_ph.bind("<Button-1>", lambda e: self.head.focus_force())
+        self.head_var.trace_add("write", lambda *a: self.update_ph(None))
+        self.head.bind("<Return>", lambda e: self.focus_row(0))
+        self.head.bind("<Down>", lambda e: self.focus_row(0))
+        self.head.bind("<Escape>", lambda e: self.cancel())
+        for text in task_items(task):
+            self.add_row(text, layout=False)
+        self.add_row("", layout=False)
+        self.pill = (0, 0, 0, 0)
+        self.relayout(first=True)
+        self.bg.show()
+        self.bg.to_top()
+        self.win.lift()
+        self.refresh_prefixes()
+        first_empty = next((r for r in self.rows if not r.var.get()), self.rows[-1])
+        self.win.after(60, lambda: force_focus(self.win, first_empty.entry))
+        self.win.after(300, lambda: force_focus(self.win, first_empty.entry) if not self.closed else None)
+        self.watch()
+
+    # ---- rows
+    def add_row(self, text="", layout=True):
+        th = self.th
+        r = _Row()
+        r.var = tk.StringVar(value=text)
+        r.label = tk.Label(self.win, font=self.f_pre, bg=th["card"], fg=self.acc, anchor="w")
+        r.entry = tk.Entry(self.win, textvariable=r.var, font=self.f_item, bd=0, relief="flat", bg=th["card"],
+                           fg=th["text"], insertbackground=self.acc, highlightthickness=0)
+        r.ph = tk.Label(self.win, text="Add an item", font=self.f_item, bg=th["card"], fg=th["sub"], anchor="w")
+        r.ph.bind("<Button-1>", lambda e, r=r: r.entry.focus_force())
+        r.entry.bind("<Return>", lambda e, r=r: self.on_enter(r))
+        r.entry.bind("<BackSpace>", lambda e, r=r: self.on_backspace(r))
+        r.entry.bind("<Up>", lambda e, r=r: self.step(r, -1))
+        r.entry.bind("<Down>", lambda e, r=r: self.step(r, 1))
+        r.entry.bind("<Escape>", lambda e: self.cancel())
+        self.rows.append(r)
+        r.var.trace_add("write", lambda *a, r=r: self.changed(r))
+        if layout:
+            self.refresh_prefixes()
+            self.relayout()
+        return r
+
+    def remove_row(self, r):
+        had_focus = self.win.focus_get() is r.entry
+        idx = self.rows.index(r)
+        self.rows.remove(r)
+        for w in (r.label, r.entry, r.ph):
+            w.destroy()
+        self.refresh_prefixes()
+        self.relayout()
+        if had_focus:
+            target_entry = self.rows[idx - 1].entry if idx > 0 else self.head
+            target_entry.focus_force()
+            target_entry.icursor("end")
+
+    def changed(self, r):
+        self.update_ph(r)
+        self.normalize()
+
+    def normalize(self):
+        """Always exactly one empty box at the end, never two."""
+        while len(self.rows) > 1 and not self.rows[-1].var.get().strip() and not self.rows[-2].var.get().strip():
+            self.remove_row(self.rows[-1])
+        if self.rows[-1].var.get().strip() and len(self.rows) < self.MAX_ITEMS:
+            self.add_row()
+
+    def update_ph(self, r):
+        if r is None:
+            if self.head_var.get():
+                self.head_ph.place_forget()
+            else:
+                self.head_ph.place(x=0, y=0, width=self.ew, height=self.head_h)
+            return
+        if r.var.get():
+            r.ph.place_forget()
+        else:
+            i = self.rows.index(r)
+            r.ph.place(x=self.pw + px(2), y=self.head_h + px(6) + i * self.row_h, height=self.row_h)
+
+    def refresh_prefixes(self):
+        for i, r in enumerate(self.rows, 1):
+            r.label.config(text="\u2022" if self.kind == "bullets" else f"{i}.")
+
+    # ---- keys
+    def entries(self):
+        return [self.head] + [r.entry for r in self.rows]
+
+    def focus_row(self, i):
+        if 0 <= i < len(self.rows):
+            self.rows[i].entry.focus_force()
+            self.rows[i].entry.icursor("end")
+        return "break"
+
+    def step(self, r, d):
+        es = self.entries()
+        j = es.index(r.entry) + d
+        if 0 <= j < len(es):
+            es[j].focus_force()
+            es[j].icursor("end")
+        return "break"
+
+    def on_enter(self, r):
+        if not r.var.get().strip():
+            self.save()
+        else:
+            self.focus_row(self.rows.index(r) + 1)
+        return "break"
+
+    def on_backspace(self, r):
+        if r.var.get() == "":
+            i = self.rows.index(r)
+            if len(self.rows) > 1:
+                self.remove_row(r)
+            else:
+                self.head.focus_force()
+                self.head.icursor("end")
+            return "break"
+
+    # ---- layout and drawing
+    def relayout(self, first=False):
+        n = len(self.rows)
+        inner = self.head_h + px(6) + n * self.row_h
+        self.body_h = self.vp + inner + px(10) + px(34) + px(14)
+        self.win.geometry(f"{self.ew}x{inner}+{self.bx + self.hp}+{self.by + self.vp}")
+        self.head.place(x=0, y=0, width=self.ew, height=self.head_h)
+        self.update_ph(None)
+        for i, r in enumerate(self.rows):
+            y = self.head_h + px(6) + i * self.row_h
+            r.label.place(x=0, y=y, width=self.pw, height=self.row_h)
+            r.entry.place(x=self.pw, y=y, width=self.ew - self.pw, height=self.row_h)
+            self.update_ph(r)
+        self.render_bg()
+        if not first:
+            self.win.lift()
+
+    def render_bg(self):
+        th, acc = self.th, self.acc
+        lw, lh = 300, self.body_h / S
+        g = Gfx(lw + 2 * PAD, lh + 2 * PAD, 3, origin=PAD)
+        g.rrect(0, 0, lw, lh, 18, fill=th["card"], outline=th["border"])
+        g.line([(18, 14 + self.head_h / S + 1), (282, 14 + self.head_h / S + 1)], 1, th["border"])
+        g.text(18, lh - 14 - 17, "Enter = next line", 11, th["sub"])
+        pw_, ph_ = 92, 34
+        px_, py_ = lw - 18 - pw_, lh - 14 - ph_
+        g.rrect(px_, py_, pw_, ph_, 17, fill=acc)
+        g.text(px_ + pw_ / 2, py_ + ph_ / 2, "Save", 14, "#FFFFFF", bold=True, anchor="mm")
+        self.pill = (px_, py_, pw_, ph_)
+        pad, cwf, chf = px(PAD), px(lw), int(self.body_h)
+        self.bg.set_image(compose_shadow(g.result(), pad, cwf, chf, px(18)))
+        self.bg.move(self.bx - pad, self.by - pad)
+
+    def bg_press(self):
+        cx, cy = cursor()
+        lx, ly = (cx - self.bx) / S, (cy - self.by) / S
+        x, y, w, h = self.pill
+        if x <= lx <= x + w and y <= ly <= y + h:
+            self.save()
+
+    # ---- finishing
+    def watch(self):
+        if self.closed:
+            return
+        try:
+            age = time.time() - self.born
+            cx, cy = cursor()
+            outside = not (self.bx - px(8) <= cx <= self.bx + self.cw + px(8) and
+                           self.by - px(8) <= cy <= self.by + self.body_h + px(8))
+            down = user32.GetAsyncKeyState(0x01) & 0x8000
+            esc = user32.GetAsyncKeyState(0x1B) & 0x8000
+            if self.task.get("status") != "active":
+                self.finish()
+                return
+            if esc and age > 0.4:
+                self.cancel()
+                return
+            if down and outside and age > 0.5:
+                self.save()                                  # clicking away keeps what you typed
+                return
+        except Exception:
+            log_exc()
+        root.after(40, self.watch)
+
+    def finish(self):
+        global list_editor
+        if self.closed:
+            return
+        self.closed = True
+        if list_editor is self:
+            list_editor = None
+        for w in (self.bg, self.win):
+            try:
+                w.destroy()
+            except Exception:
+                log_exc()
+        c = self.card
+        if c is not None and c.hwnd in windows:
+            c.editing = False
+            c.show()
+
+    def cancel(self):
+        self.finish()
+        return "break"
+
+    def save(self):
+        if self.closed:
+            return
+        t = self.task
+        head = self.head_var.get().strip()
+        items = [r.var.get().strip() for r in self.rows if r.var.get().strip()]
+        t["text"] = (head or str(t["text"]))[:300]
+        t["items"] = items[: self.MAX_ITEMS]
+        self.finish()
+        refit_card(t)
+        save()
+        refresh_all()
+
+
 # ================================================================== add-task bar
 def add_dialog(edit_task=None):
     global add_ui
@@ -1922,9 +2340,9 @@ def add_dialog(edit_task=None):
     ph = {"on": edit_task is None}
     if edit_task is None:
         entry.insert(0, "New task")
-    else:                                         # editing a list: show its items, ready for more
+    else:                                         # renaming a task: show its text
         entry.config(fg=th["text"])
-        entry.insert(0, ", ".join(task_items(edit_task)) + (", " if len(task_items(edit_task)) < 2 else ""))
+        entry.insert(0, str(edit_task["text"]))
     done = {"v": False}
     opened = time.time()
 
@@ -1945,7 +2363,7 @@ def add_dialog(edit_task=None):
         close()
         if edit_task is not None:
             if text:
-                set_items(edit_task, text)
+                rename_task(edit_task, text)
         elif text:
             add_task(text)
 
@@ -2146,18 +2564,17 @@ _watch = {"fg": None, "n": 0}
 
 
 def keep_bottom():
-    """Runs every 30 ms. Re-checks the cards the instant the focused window changes (so switching
-    from the desktop to a window never leaves a card on top), otherwise about every 120 ms
-    (240 ms while a card is lifted, to avoid flicker). About every 0.4 s it also re-shows or
-    re-positions a card Windows hid or moved. While you drag a card it touches nothing."""
+    """Runs every 30 ms but only LOOKS: it re-stacks the cards when the focus changes or the desktop
+    covers them, and does nothing at all while you drag a card. About every 0.4 s it re-shows or
+    re-positions a card Windows hid or moved. In steady state it changes no window, so nothing flickers."""
     try:
         if not any(c.dragging for c in cards.values()):
             fg = user32.GetForegroundWindow()
             _watch["n"] += 1
             n, changed = _watch["n"], fg != _watch["fg"]
             _watch["fg"] = fg
-            if changed or n % (8 if any(c.lifted for c in cards.values()) else 4) == 0:
-                layer_all()
+            if changed or n % 4 == 0:
+                check_layers()
             if n % 13 == 0:
                 for card in list(cards.values()):
                     card.heal()
