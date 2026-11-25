@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.10
+### Improved
+- **Smoother Arrange animation.** The glide used a separate 16 ms timer per card, which Windows rounds up to about 31 ms, so it ran at roughly 30 frames per second and took about 50% longer than intended. All cards now share one animator that follows the clock, asks Windows for a 1 ms timer while it runs, and moves every card in a single batched call per frame. Same look, about four times as many updates, and it always finishes on time. Background checks pause while cards glide.
+
 ## 1.0.9
 ### New
 - **"Out of" bar in the weekly chart.** Behind each accent-colored bar there is now a grey bar showing that day's tasks (completed + deleted). Complete 6 and delete 4 and the grey bar shows 10 with the accent bar at 6, labelled "6/10". The header shows "6/10 today" in the same way. Deleting a task you had already completed does not count against you.

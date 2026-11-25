@@ -32,7 +32,7 @@ def set_dpi_aware():
 set_dpi_aware()
 
 APP_NAME = "DeskTask"
-VERSION = "1.0.9"
+VERSION = "1.0.10"
 APPDATA = os.environ.get("APPDATA") or os.path.expanduser("~")
 DATA_DIR = os.path.join(APPDATA, "DeskTask")
 FILE = os.path.join(DATA_DIR, "data.json")
@@ -456,25 +456,60 @@ def arrange_cards():
             x, y = x + w + px(20), ay
         plan.append((t, c, min(x, max(left, right - w - px(10))), y))
         y += h + gap
-    steps, stagger = 24, 70
+    run_glides(plan)
 
-    def glide(t, c, x1, y1):
-        x0, y0 = c.x + c.pad, c.y + c.pad
 
-        def frame(k):
-            if c.hwnd not in windows:                       # card was completed or deleted meanwhile
-                return
-            if k >= steps:
-                place_card(t, x1, y1)
-                return
-            e = ease_out_back((k + 1) / steps)              # smooth glide with a tiny overshoot
-            c.move(x0 + (x1 - x0) * e - c.pad, y0 + (y1 - y0) * e - c.pad)
-            root.after(16, lambda: frame(k + 1))
-        frame(0)
+_anim = {"running": False, "glides": []}
 
-    for i, (t, c, x, y) in enumerate(plan):
-        root.after(i * stagger, lambda t=t, c=c, x=x, y=y: glide(t, c, x, y))
-    root.after(len(plan) * stagger + steps * 16 + 150, save)
+
+def run_glides(plan, duration=0.42, stagger=0.065):
+    """One shared, time-based animator for all cards (same look as before, but smooth):
+    positions follow the clock instead of counting frames, so a late frame never slows the
+    animation down, and every card moves in a single batched call per frame."""
+    if _anim["running"]:                                   # pressed again: finish the previous run first
+        for g in _anim["glides"]:
+            if not g["done"]:
+                g["done"] = True
+                g["t"]["x"], g["t"]["y"] = g["x1"], g["y1"]
+                if g["c"].hwnd in windows:
+                    g["c"].move(g["x1"] - g["c"].pad, g["y1"] - g["c"].pad)
+    glides = [{"t": t, "c": c, "x0": c.x + c.pad, "y0": c.y + c.pad, "x1": x, "y1": y,
+               "start": i * stagger, "dur": duration, "done": False}
+              for i, (t, c, x, y) in enumerate(plan)]
+    _anim["running"], _anim["glides"] = True, glides
+    timer_resolution(True)
+    t0 = time.perf_counter()
+
+    def frame():
+        el = time.perf_counter() - t0
+        batch, waiting = [], False
+        for g in glides:
+            c = g["c"]
+            if g["done"]:
+                continue
+            if c.hwnd not in windows or c.dragging:        # completed, deleted or grabbed meanwhile
+                g["done"] = True
+                continue
+            k = (el - g["start"]) / g["dur"]
+            if k <= 0:
+                waiting = True
+            elif k >= 1:
+                g["done"] = True
+                g["t"]["x"], g["t"]["y"] = g["x1"], g["y1"]
+                batch.append((c, g["x1"] - c.pad, g["y1"] - c.pad))
+            else:
+                e = ease_out_back(k)                       # smooth glide with a tiny overshoot
+                batch.append((c, g["x0"] + (g["x1"] - g["x0"]) * e - c.pad,
+                              g["y0"] + (g["y1"] - g["y0"]) * e - c.pad))
+                waiting = True
+        move_many(batch)
+        if waiting:
+            root.after(8, frame)
+        else:
+            _anim["running"] = False
+            timer_resolution(False)
+            save()
+    frame()
 
 
 def separate_overlaps():
@@ -1031,6 +1066,12 @@ user32.GetAncestor.restype = W_.HWND
 user32.GetForegroundWindow.restype = W_.HWND
 dwmapi.DwmGetWindowAttribute.argtypes = [W_.HWND, W_.DWORD, ctypes.c_void_p, W_.DWORD]
 dwmapi.DwmSetWindowAttribute.argtypes = [W_.HWND, W_.DWORD, ctypes.c_void_p, W_.DWORD]
+user32.BeginDeferWindowPos.argtypes = [ctypes.c_int]
+user32.BeginDeferWindowPos.restype = ctypes.c_void_p
+user32.DeferWindowPos.argtypes = [ctypes.c_void_p, W_.HWND, W_.HWND, ctypes.c_int, ctypes.c_int,
+                                  ctypes.c_int, ctypes.c_int, W_.UINT]
+user32.DeferWindowPos.restype = ctypes.c_void_p
+user32.EndDeferWindowPos.argtypes = [ctypes.c_void_p]
 user32.RegisterHotKey.argtypes = [W_.HWND, ctypes.c_int, W_.UINT, W_.UINT]
 user32.UpdateLayeredWindow.argtypes = [W_.HWND, W_.HDC, ctypes.POINTER(W_.POINT),
                                        ctypes.POINTER(W_.SIZE), W_.HDC,
@@ -1164,6 +1205,35 @@ def desktop_covers(card):
 
 def virtual_screen():
     return tuple(user32.GetSystemMetrics(i) for i in (76, 77, 78, 79))   # x, y, w, h
+
+
+def timer_resolution(fine):
+    """Windows timers normally tick every ~15 ms; ask for 1 ms while an animation runs."""
+    try:
+        (ctypes.windll.winmm.timeBeginPeriod if fine else ctypes.windll.winmm.timeEndPeriod)(1)
+    except Exception:
+        pass
+
+
+def move_many(items):
+    """Moves several windows (window, x, y) in ONE call, so Windows redraws them together."""
+    items = [(w, int(x), int(y)) for w, x, y in items]
+    if not items:
+        return
+    try:
+        h = user32.BeginDeferWindowPos(len(items))
+        if not h:
+            raise OSError("BeginDeferWindowPos failed")
+        for w, x, y in items:
+            h = user32.DeferWindowPos(h, w.hwnd, None, x, y, 0, 0, 0x0001 | 0x0004 | 0x0010 | 0x0200 | 0x0400)
+            if not h:
+                raise OSError("DeferWindowPos failed")
+        user32.EndDeferWindowPos(h)
+        for w, x, y in items:
+            w.x, w.y = x, y
+    except Exception:                                      # never lose a move: fall back to one by one
+        for w, x, y in items:
+            w.move(x, y)
 
 
 class Layered:
@@ -2642,7 +2712,7 @@ def keep_bottom():
     covers them, and does nothing at all while you drag a card. About every 0.4 s it re-shows or
     re-positions a card Windows hid or moved. In steady state it changes no window, so nothing flickers."""
     try:
-        if not any(c.dragging for c in cards.values()):
+        if not _anim["running"] and not any(c.dragging for c in cards.values()):
             fg = user32.GetForegroundWindow()
             _watch["n"] += 1
             n, changed = _watch["n"], fg != _watch["fg"]
