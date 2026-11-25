@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.9
+### New
+- **"Out of" bar in the weekly chart.** Behind each accent-colored bar there is now a grey bar showing that day's tasks (completed + deleted). Complete 6 and delete 4 and the grey bar shows 10 with the accent bar at 6, labelled "6/10". The header shows "6/10 today" in the same way. Deleting a task you had already completed does not count against you.
+- **Clear progress.** A new "Clear progress..." button in Customize, with a confirmation, resets the weekly chart and empties the Done list. Your current tasks are kept.
+- **Your font weight applies to the whole app.** The Font weight you pick in Customize (Regular / Semibold / Bold / Extra Bold) now styles every window, menu card, dialog and text box, not just the task cards. Headings are one step heavier. Long labels shrink slightly instead of overflowing.
+### Changed
+- **Lists that are not filled in go back to normal.** Choose Bullet or Numbered list and then click away or press Esc without adding any items, and the task simply stays a normal task.
+- **Turning a list back into a normal task removes its items** and keeps only the headline.
+- **Arrange cards** now keeps your highest card where it is and glides the rest into a neat column right underneath it, in their current top-to-bottom order. A full column continues to its right.
+
 ## 1.0.8
 ### New
 - **Lists have a headline.** A bullet or numbered list now shows its first line as a larger headline, with a thin rule and then the items below it.

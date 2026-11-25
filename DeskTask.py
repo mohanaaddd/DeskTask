@@ -32,7 +32,7 @@ def set_dpi_aware():
 set_dpi_aware()
 
 APP_NAME = "DeskTask"
-VERSION = "1.0.8"
+VERSION = "1.0.9"
 APPDATA = os.environ.get("APPDATA") or os.path.expanduser("~")
 DATA_DIR = os.path.join(APPDATA, "DeskTask")
 FILE = os.path.join(DATA_DIR, "data.json")
@@ -59,6 +59,7 @@ state = {"settings": {"theme": "light", "accent": "Blue", "size": 15,
                       "capitalize": False},
          "tasks": [],
          "history": {},                      # completed-per-day counts (survives deleting tasks)
+         "removed": {},                      # deleted-per-day counts (tasks given up on)
          "meta": {"tutorial_seen": False}}
 
 # runtime globals (set in main)
@@ -187,6 +188,9 @@ def load_state():
                 if t["status"] == "done" and t.get("done_at"):
                     hist[t["done_at"][:10]] = hist.get(t["done_at"][:10], 0) + 1
         state["history"] = {str(k): int(v) for k, v in hist.items() if isinstance(v, (int, float))}
+        rem = data.get("removed")
+        state["removed"] = ({str(k): int(v) for k, v in rem.items() if isinstance(v, (int, float))}
+                            if isinstance(rem, dict) else {})
         state["meta"]["tutorial_seen"] = bool(data.get("meta", {}).get("tutorial_seen", False))
         return True
     return False
@@ -211,13 +215,17 @@ def tasks_with(status):
     return [t for t in state["tasks"] if t["status"] == status]
 
 
-def bump_history(iso, delta):
+def bump_counts(counts, iso, delta):
     day = str(iso)[:10]
-    n = max(0, state["history"].get(day, 0) + delta)
+    n = max(0, counts.get(day, 0) + delta)
     if n:
-        state["history"][day] = n
+        counts[day] = n
     else:
-        state["history"].pop(day, None)
+        counts.pop(day, None)
+
+
+def bump_history(iso, delta):
+    bump_counts(state["history"], iso, delta)
 
 
 def week_start(d=None):
@@ -227,9 +235,14 @@ def week_start(d=None):
 
 
 def week_counts():
+    """Saturday..Friday: (day, tasks completed, tasks completed + deleted = that day's tasks)."""
     start = week_start()
-    days = [start + timedelta(days=i) for i in range(7)]
-    return [(d, int(state["history"].get(d.isoformat(), 0))) for d in days]
+    out = []
+    for i in range(7):
+        d = start + timedelta(days=i)
+        done = int(state["history"].get(d.isoformat(), 0))
+        out.append((d, done, done + int(state["removed"].get(d.isoformat(), 0))))
+    return out
 
 
 def today_count():
@@ -402,9 +415,7 @@ def set_kind(task, kind):
     type the items right on the card. On a list: switch bullets <-> numbers, or click the active
     type again to turn it back into a normal task."""
     old = task.get("kind", "task")
-    if old == kind:
-        items = task_items(task)
-        task["text"] = task["text"] + (": " + ", ".join(items) if items else "")
+    if old == kind:                                        # back to a normal task: the items are removed
         task.pop("kind", None)
         task.pop("items", None)
         refit_card(task)
@@ -430,16 +441,21 @@ def rename_task(task, text):
 
 
 def arrange_cards():
-    """Glides every card, one after another, into a neat layout where none covers another."""
-    plan, taken = [], []
-    for t in sorted(tasks_with("active"), key=lambda t: t.get("created", "")):
-        c = cards.get(t["id"])
-        if not c:
-            continue
-        size = (c.w - 2 * c.pad, c.h - 2 * c.pad)
-        x, y = free_slot(taken, size)
-        taken.append((x, y, size[0], size[1]))
-        plan.append((t, c, x, y))
+    """Keeps the highest card where it is and glides all the others, one after another, into a neat
+    column right under it (ordered by their current height). A full column continues to its right."""
+    actives = [(t, cards[t["id"]]) for t in tasks_with("active") if t["id"] in cards and not cards[t["id"]].editing]
+    if not actives:
+        return
+    actives.sort(key=lambda tc: (tc[0]["y"], tc[0]["x"]))
+    ax, ay = actives[0][0]["x"], actives[0][0]["y"]
+    left, top, right, bottom = work_area(ax, ay)
+    gap, x, y, plan = px(14), ax, ay, []
+    for t, c in actives:
+        w, h = c.w - 2 * c.pad, c.h - 2 * c.pad
+        if y > ay and y + h > bottom - px(24):               # column is full: start the next one
+            x, y = x + w + px(20), ay
+        plan.append((t, c, min(x, max(left, right - w - px(10))), y))
+        y += h + gap
     steps, stagger = 24, 70
 
     def glide(t, c, x1, y1):
@@ -505,8 +521,12 @@ def complete_task(task):
 
 
 def delete_task(task):
+    was_open = task["status"] == "active"
     task["status"] = "deleted"
     task["deleted_at"] = now_iso()
+    if was_open:                                           # gave up on it: counts toward that day's total
+        task["del_counted"] = True
+        bump_counts(state["removed"], task["deleted_at"], 1)
     card = cards.pop(task["id"], None)
     sync_layers()
     if card:
@@ -521,6 +541,8 @@ def delete_task(task):
 def restore_task(task):
     if task.get("done_at"):
         bump_history(task["done_at"], -1)                      # it will be completed again later
+    if task.pop("del_counted", False) and task.get("deleted_at"):
+        bump_counts(state["removed"], task["deleted_at"], -1)
     task["status"] = "active"
     task.pop("done_at", None)
     task.pop("deleted_at", None)
@@ -529,6 +551,14 @@ def restore_task(task):
             for o in tasks_with("active") if o is not task and o.get("x") is not None):
         task["x"], task["y"] = next_pos(exclude=task["id"])
     cards[task["id"]] = Card(task)
+    save()
+    refresh_all()
+
+
+def clear_progress():
+    """Resets the weekly chart and empties the Done list. Current tasks stay."""
+    state["history"], state["removed"] = {}, {}
+    state["tasks"] = [t for t in state["tasks"] if t["status"] != "done"]
     save()
     refresh_all()
 
@@ -583,6 +613,16 @@ def find_font(weight):
             if os.path.exists(p):
                 return p
     return None
+
+
+def ui_weight(bold=False):
+    """Weight for window text. Follows the Font weight chosen in Customize; headings are one step heavier."""
+    i = WEIGHTS.index(state["settings"].get("weight", "semibold"))
+    return WEIGHTS[min(len(WEIGHTS) - 1, i + (1 if bold else 0))]
+
+
+def tk_weight():
+    return "normal" if state["settings"].get("weight") == "regular" else "bold"
 
 
 FONT_PATH = {}
@@ -653,13 +693,19 @@ class Gfx:
             self.d.ellipse((x - wd / 2, y - wd / 2, x + wd / 2, y + wd / 2), fill=fill)
 
     def font(self, size, bold=False):
-        return load_font(round(size * S), bold)
+        return load_font(round(size * S), ui_weight(bold))
 
     def text_w(self, s, size, bold=False):
         return self.font(size, bold).getlength(s) / S
 
     def text(self, x, y, s, size, fill, bold=False, anchor="lm"):
         self.texts.append((x, y, s, size, fill, bold, anchor))     # drawn crisp at the end
+
+    def text_fit(self, x, y, s, size, fill, bold=False, anchor="lm", maxw=None):
+        """Like text(), but shrinks the text a little if a heavy font weight would not fit."""
+        while maxw and size > 8 and self.text_w(s, size, bold) > maxw:
+            size -= 0.5
+        self.text(x, y, s, size, fill, bold, anchor)
 
     def fit(self, s, size, maxw, bold=False):
         if self.text_w(s, size, bold) <= maxw:
@@ -868,8 +914,8 @@ def seg_control(g, th, x, y, w, h, labels, sel, cbs):
         if i == sel:
             g.rrect(sx, y + 2, sw, h - 4, 8, fill=th["seg_on"],
                     outline=th["sep"] if state["settings"]["theme"] == "light" else None)
-        g.text(sx + sw / 2, y + h / 2, label, 13 if n <= 3 else 12, th["text"] if i == sel else th["sub"],
-               bold=(i == sel), anchor="mm")
+        g.text_fit(sx + sw / 2, y + h / 2, label, 13 if n <= 3 else 12, th["text"] if i == sel else th["sub"],
+                   bold=(i == sel), anchor="mm", maxw=sw - 8)
         g.hit(sx, y, sw, h, "click", cbs[i])
 
 
@@ -1348,7 +1394,7 @@ class Card(Layered):
         tx = hp if is_list else hp + dot + px(12)
         rows, marks = [], []             # rows: (indent, text, font, line height, ascent, gap before)
         if is_list:
-            hf = load_font(round(s["size"] * 1.32 * S), "extra" if s["weight"] == "extra" else "bold")
+            hf = load_font(round(s["size"] * 1.32 * S), ui_weight(True))
             ha, hd = hf.getmetrics()
             hlh = int((ha + hd) * 1.1)
             for line in wrap(display_text(self.task["text"]), hf, cw - tx - hp) or [""]:
@@ -1556,7 +1602,7 @@ class Panel(Layered):
 
 
 class CustomizePanel(Panel):
-    key, bw, bh = "customize", 360, 580
+    key, bw, bh = "customize", 360, 632
 
     def draw(self, g, th):
         s = state["settings"]
@@ -1589,12 +1635,19 @@ class CustomizePanel(Panel):
         g.rrect(20, 428, 320, 132, 16, fill=th["row"])
         for ly in (472, 516):
             g.line([(36, ly), (324, ly)], 1, th["sep"])
-        g.text(36, 450, "Capitalize Each Word", 14.5, th["text"])
+        g.text_fit(36, 450, "Capitalize Each Word", 14.5, th["text"], maxw=212)
         switch(g, th, 260, 436, s["capitalize"], lambda: set_setting("capitalize", not s["capitalize"]))
-        g.text(36, 494, "Keep cards above windows", 14.5, th["text"])
+        g.text_fit(36, 494, "Keep cards above windows", 14.5, th["text"], maxw=212)
         switch(g, th, 260, 480, s["above"], lambda: set_setting("above", not s["above"]))
-        g.text(36, 538, "Start with Windows", 14.5, th["text"])
+        g.text_fit(36, 538, "Start with Windows", 14.5, th["text"], maxw=212)
         switch(g, th, 260, 524, startup_enabled(), toggle_startup)
+
+        g.rrect(20, 572, 320, 40, 14, fill=mix(RED, th["bg"], .14))
+        g.text_fit(180, 592, "Clear progress\u2026", 14.5, RED, bold=True, anchor="mm", maxw=290)
+        g.hit(20, 572, 320, 40, "click", lambda: ConfirmPanel(
+            title="Clear all progress?",
+            lines=["Resets your weekly chart and empties the Done list.", "Your current tasks are kept."],
+            label="Clear", action=clear_progress))
 
 
 class TasksPanel(Panel):
@@ -1630,23 +1683,27 @@ class TasksPanel(Panel):
         g.rrect(20, 64, 340, 132, 16, fill=th["row"])
         counts = week_counts()                                   # Saturday .. Friday
         today = date.today()
-        ti = next(i for i, (d, _) in enumerate(counts) if d == today)
-        today_n, week = counts[ti][1], sum(c for _, c in counts)
+        ti = next(i for i, (d, _, _) in enumerate(counts) if d == today)
+        today_done, today_all, week = counts[ti][1], counts[ti][2], sum(c[1] for c in counts)
         g.text(38, 86, "This week", 12, th["sub"], bold=True)
-        g.text(342, 86, f"{today_n} today \u00b7 {week} this week", 12, th["sub"], anchor="rm")
-        top = max(max(c for _, c in counts), 1)
+        g.text(342, 86, (f"{today_done}/{today_all}" if today_all > today_done else f"{today_done}")
+               + f" today \u00b7 {week} this week", 12, th["sub"], anchor="rm")
+        top = max(max(c[2] for c in counts), 1)
         slot = 304 / 7
-        for i, (d, c) in enumerate(counts):
+        grey = mix(th["sub"], th["row"], .3)                     # the day's tasks (done + deleted)
+        for i, (d, done, total) in enumerate(counts):
             future = d > today
             cx = 38 + slot * i + slot / 2
-            h = 6 if c == 0 else 8 + (c / top) * 44
-            if c == 0:
-                col = mix(th["track"], th["row"], .5) if future else th["track"]
+            if total == 0:
+                g.rrect(cx - 12, 156, 24, 6, 3, fill=mix(th["track"], th["row"], .5) if future else th["track"])
             else:
-                col = acc if i == ti else mix(acc, th["row"], .5)
-            g.rrect(cx - 12, 162 - h, 24, h, 6, fill=col)
-            if c:
-                g.text(cx, 162 - h - 9, str(c), 11, th["sub"], bold=True, anchor="mm")
+                ht = 8 + (total / top) * 44
+                g.rrect(cx - 12, 162 - ht, 24, ht, 6, fill=grey)
+                if done:
+                    hd = 8 + (done / top) * 44
+                    g.rrect(cx - 12, 162 - hd, 24, hd, 6, fill=acc if i == ti else mix(acc, th["row"], .5))
+                label = f"{done}/{total}" if total > done else str(done)
+                g.text(cx, 162 - ht - 9, label, 10.5 if total > done else 11, th["sub"], bold=True, anchor="mm")
             g.text(cx, 180, "SSMTWTF"[i], 11.5,
                    th["text"] if i == ti else (mix(th["sub"], th["row"], .6) if future else th["sub"]),
                    bold=(i == ti), anchor="mm")
@@ -1847,10 +1904,13 @@ class TutorialPanel(Panel):
 
 
 class ConfirmPanel(Panel):
+    """'Are you sure?' box. By default it asks about deleting a task; other actions pass their own text."""
     key, bw, bh = "confirm", 340, 184
 
-    def __init__(self, task):
-        self.task = task
+    def __init__(self, task=None, title="Delete this task?", lines=None, label="Delete", action=None):
+        self.task, self.title, self.label = task, title, label
+        self.lines = lines or ([task_plain(task), "You can restore it later from Tasks."] if task else [])
+        self.action = action
         super().__init__()
 
     def initial_pos(self, W, H):                                 # appears right where you clicked
@@ -1859,21 +1919,24 @@ class ConfirmPanel(Panel):
         return min(max(left, cx - W // 2), right - W), min(max(top, cy - H // 2), bottom - H)
 
     def confirm(self):
-        if self.task.get("status") == "active":
+        if self.action:
+            self.action()
+        elif self.task is not None and self.task.get("status") == "active":
             delete_task(self.task)
         self.close()
 
     def draw(self, g, th):
         g.hit(0, 0, self.bw, self.bh, "move", None)
-        g.text(26, 40, "Delete this task?", 18, th["text"], bold=True)
-        g.text(26, 72, g.fit(task_plain(self.task), 14, self.bw - 52), 14, th["sub"])
-        g.text(26, 96, "You can restore it later from Tasks.", 12, th["sub"])
+        g.text(26, 40, self.title, 18, th["text"], bold=True)
+        for i, line in enumerate(self.lines[:2]):
+            size = 14 if i == 0 else 12
+            g.text(26, 72 + i * 24, g.fit(line, size, self.bw - 52), size, th["sub"])
         w = (self.bw - 52 - 12) / 2
         g.rrect(26, 124, w, 40, 20, fill=th["seg"])
-        g.text(26 + w / 2, 144, "Cancel", 14.5, th["text"], bold=True, anchor="mm")
+        g.text_fit(26 + w / 2, 144, "Cancel", 14.5, th["text"], bold=True, anchor="mm", maxw=w - 12)
         g.hit(26, 124, w, 40, "click", self.close)
         g.rrect(38 + w, 124, w, 40, 20, fill=RED)
-        g.text(38 + w + w / 2, 144, "Delete", 14.5, "#FFFFFF", bold=True, anchor="mm")
+        g.text_fit(38 + w + w / 2, 144, self.label, 14.5, "#FFFFFF", bold=True, anchor="mm", maxw=w - 12)
         g.hit(38 + w, 124, w, 40, "click", self.confirm)
 
 
@@ -1962,14 +2025,14 @@ class CardMenu(Layered):
             g.rrect(bx, by, self.BW, self.BH, 12, fill=fill)
             icon = {"bullets": icon_bullets, "numbers": icon_numbers, "delete": icon_trash}[key]
             icon(g, bx + 22, by + self.BH / 2, 17, fg)
-            g.text(bx + 42, by + self.BH / 2, label, 13, fg, bold=True)
+            g.text_fit(bx + 42, by + self.BH / 2, label, 13, fg, bold=True, maxw=self.BW - 50)
         if self.hover is not None:
             key, label, desc = self.ITEMS[self.hover]
             iy = self.info_y(self.hover)
             g.rrect(self.info_x, iy, self.IW, self.IH, 16, fill=th["card"], outline=th["sep"])
             if key == kind:
                 label = f"{label} (on)"
-                desc = "Double-click the card to edit its items. Click here to turn it back into a normal task."
+                desc = "Double-click the card to edit its items. Click here for a normal task (the items are removed)."
             g.text(self.info_x + 16, iy + 26, label, 14.5, th["text"], bold=True)
             for k, line in enumerate(wrap(desc, g.font(12.5), (self.IW - 32) * S)[:4]):
                 g.text(self.info_x + 16, iy + 54 + k * 19, line, 12.5, th["sub"])
@@ -2068,7 +2131,7 @@ class ListEditor:
         self.cw, self.hp, self.vp = px(300), px(18), px(14)
         self.ew = self.cw - 2 * self.hp
         self.f_head = tkfont.Font(family=TK_FONT, size=-round(s["size"] * 1.32 * S), weight="bold")
-        self.f_item = tkfont.Font(family=TK_FONT, size=-round(s["size"] * S))
+        self.f_item = tkfont.Font(family=TK_FONT, size=-round(s["size"] * S), weight=tk_weight())
         self.f_pre = tkfont.Font(family=TK_FONT, size=-round(s["size"] * S), weight="bold")
         self.head_h = self.f_head.metrics("linespace") + px(12)
         self.row_h = self.f_item.metrics("linespace") + px(12)
@@ -2288,7 +2351,14 @@ class ListEditor:
             c.show()
 
     def cancel(self):
+        t = self.task
         self.finish()
+        if not task_items(t) and t.get("kind"):            # a list nobody filled in: back to a normal task
+            t.pop("kind", None)
+            t.pop("items", None)
+            refit_card(t)
+            save()
+            refresh_all()
         return "break"
 
     def save(self):
@@ -2298,7 +2368,11 @@ class ListEditor:
         head = self.head_var.get().strip()
         items = [r.var.get().strip() for r in self.rows if r.var.get().strip()]
         t["text"] = (head or str(t["text"]))[:300]
-        t["items"] = items[: self.MAX_ITEMS]
+        if items:
+            t["items"] = items[: self.MAX_ITEMS]
+        else:                                              # no items typed: it is just a normal task again
+            t.pop("kind", None)
+            t.pop("items", None)
         self.finish()
         refit_card(t)
         save()
@@ -2334,7 +2408,7 @@ def add_dialog(edit_task=None):
     ew, eh = cw - px(48), px(34)
     win.geometry(f"{ew}x{eh}+{X + px(24)}+{Y + (ch - eh) // 2}")
     win.attributes("-topmost", True)
-    entry = tk.Entry(win, relief="flat", bd=0, font=(TK_FONT, -px(17)), bg=th["card"], fg=th["sub"],
+    entry = tk.Entry(win, relief="flat", bd=0, font=(TK_FONT, -px(17), tk_weight()), bg=th["card"], fg=th["sub"],
                      insertbackground=ACCENTS[s["accent"]], highlightthickness=0)
     entry.pack(fill="both", expand=True)
     ph = {"on": edit_task is None}
